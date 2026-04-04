@@ -113,10 +113,10 @@ describe('calcHighestHigh', () => {
 describe('calcLowestLow', () => {
   it('returns min of previous 30 candles (excluding last)', () => {
     const lows = Array.from({ length: 35 }, (_, i) => 100 - i);
-    // lows = [100, 99, ..., 66]
-    // slice(-31, -1) = [69, 68, ..., 67, 66] → min = 66
+    // lows = [100, 99, ..., 66] (35 elements, indices 0..34)
+    // slice(-31, -1) = indices 4..33 = [96, 95, ..., 67] → min = 67
     const ll = calcLowestLow(lows, 30);
-    assert.equal(ll, 66);
+    assert.equal(ll, 67);
   });
 });
 

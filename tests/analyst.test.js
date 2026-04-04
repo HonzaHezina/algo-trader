@@ -95,7 +95,8 @@ describe('Analyst: Stop Loss calculation', () => {
 
 describe('Analyst: Position sizing', () => {
   it('risk_amount_usdt = 2% of capital for normal ATR', () => {
-    const signal = { current_price: 100, direction: 'long', atr14: 2, volume_ratio: 1.5, momentum_roc12: 0.03, coin: 'SOL/USDT', id: 'abc' };
+    // ATR14=5 → stop distance 10% → position $200 (within 45% cap) → risk = $200 * 0.10 = $20
+    const signal = { current_price: 100, direction: 'long', atr14: 5, volume_ratio: 1.5, momentum_roc12: 0.03, coin: 'SOL/USDT', id: 'abc' };
     const card = computeTradeCard(signal, { available_capital: 1000 });
     // Normal ATR → risk should be ~2% = $20
     assert.ok(Math.abs(card.risk_amount_usdt - 20) < 1, `Expected ~$20 risk, got ${card.risk_amount_usdt}`);
