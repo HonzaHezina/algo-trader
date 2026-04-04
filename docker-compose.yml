@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: algotrader
+      POSTGRES_USER: algotrader
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./db/seeds/default_config.sql:/docker-entrypoint-initdb.d/002_seeds.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U algotrader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:latest
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=algotrader
+      - DB_POSTGRESDB_USER=algotrader
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - WEBHOOK_URL=https://n8n.${DOMAIN:-localhost}
+      - GENERIC_TIMEZONE=UTC
+      - N8N_METRICS=true
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "5678"
+
+volumes:
+  pg_data:
+  n8n_data:

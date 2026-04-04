@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "note": "Requires GITHUB_PAT set in user-scope config"
+    }
+  }
+}
