@@ -1,0 +1,63 @@
+{
+  "agent_id": "analyst",
+  "name": "Trade Analyst",
+  "description": "Analyzuje breakout signály a vytváří kompletní trade setup karty",
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 3000,
+  "temperature": 0.2,
+  "system_prompt_file": "system_prompt.md",
+  "tools": [
+    {
+      "name": "get_candidate_signals",
+      "type": "database",
+      "config": {
+        "query": "SELECT id, coin, direction, signal_type, signal_data FROM signals WHERE status = 'candidate' AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC LIMIT 10"
+      }
+    },
+    {
+      "name": "get_portfolio",
+      "type": "database",
+      "config": {
+        "query": "SELECT available_capital, total_value, (SELECT COUNT(*) FROM trades WHERE status = 'open') as open_positions_count FROM portfolio WHERE id = 1"
+      }
+    },
+    {
+      "name": "get_mindsdb_prediction",
+      "type": "http",
+      "config": {
+        "url": "http://{{MINDSDB_HOST}}:{{MINDSDB_PORT}}/api/sql/query",
+        "method": "POST",
+        "body": {
+          "query": "SELECT direction, confidence, predicted_move_pct FROM price_predictor WHERE coin = '{{coin}}'"
+        },
+        "optional": true,
+        "fallback": null
+      }
+    },
+    {
+      "name": "update_signal",
+      "type": "database",
+      "config": {
+        "query": "UPDATE signals SET status = $2, trade_card = $3, entry_price = $4, stop_loss = $5, trailing_atr_mult = $6, trail_activation_pct = $7, position_size_usdt = $8, risk_amount_usdt = $9, confidence_score = $10, reasoning = $11, mindsdb_prediction = $12, analyzed_at = NOW() WHERE id = $1"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "required": ["signal_id", "coin", "direction", "entry_price", "stop_loss", "position_size_usdt"],
+    "properties": {
+      "signal_id": { "type": "string" },
+      "coin": { "type": "string" },
+      "direction": { "type": "string" },
+      "entry_price": { "type": "number" },
+      "stop_loss": { "type": "number" },
+      "trailing_atr_mult": { "type": "number" },
+      "trail_activation_pct": { "type": "number" },
+      "risk_per_unit_pct": { "type": "number" },
+      "position_size_usdt": { "type": "number" },
+      "risk_amount_usdt": { "type": "number" },
+      "confidence_score": { "type": "number" },
+      "reasoning": { "type": "string" }
+    }
+  }
+}

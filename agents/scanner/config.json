@@ -1,0 +1,57 @@
+{
+  "agent_id": "scanner",
+  "name": "Market Scanner",
+  "description": "Skenuje trh a identifikuje breakout kandidáty na 4h timeframe",
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 2000,
+  "temperature": 0.1,
+  "system_prompt_file": "system_prompt.md",
+  "tools": [
+    {
+      "name": "fetch_ohlcv",
+      "type": "http",
+      "config": {
+        "url": "https://api.binance.com/api/v3/klines",
+        "method": "GET",
+        "params": {
+          "symbol": "{{symbol}}",
+          "interval": "4h",
+          "limit": 200
+        }
+      }
+    },
+    {
+      "name": "get_watchlist",
+      "type": "database",
+      "config": {
+        "query": "SELECT symbol, display_name, base_asset FROM watchlist WHERE is_active = true"
+      }
+    },
+    {
+      "name": "save_signal",
+      "type": "database",
+      "config": {
+        "query": "INSERT INTO signals (coin, direction, signal_type, signal_data, status, expires_at, created_at) VALUES ($1, $2, $3, $4, 'candidate', NOW() + INTERVAL '30 minutes', NOW()) RETURNING id"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "array",
+    "items": {
+      "type": "object",
+      "required": ["coin", "direction", "signal_type", "current_price", "atr14"],
+      "properties": {
+        "coin": { "type": "string" },
+        "direction": { "type": "string", "enum": ["long", "short"] },
+        "signal_type": { "type": "string" },
+        "current_price": { "type": "number" },
+        "breakout_level": { "type": "number" },
+        "momentum_roc12": { "type": "number" },
+        "volume_ratio": { "type": "number" },
+        "atr14": { "type": "number" },
+        "atr7": { "type": "number" },
+        "timestamp": { "type": "string" }
+      }
+    }
+  }
+}

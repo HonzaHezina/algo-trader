@@ -1,0 +1,83 @@
+{
+  "agent_id": "risk_controller",
+  "name": "Risk Controller",
+  "description": "Validuje obchody proti risk pravidlům. Má právo vetovat. Temperature 0 = deterministický.",
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 1500,
+  "temperature": 0.0,
+  "system_prompt_file": "system_prompt.md",
+  "tools": [
+    {
+      "name": "get_trade_card",
+      "type": "database",
+      "config": {
+        "query": "SELECT id, trade_card, entry_price, stop_loss, position_size_usdt, risk_amount_usdt, confidence_score, created_at, expires_at FROM signals WHERE id = $1 AND status = 'analyzed'"
+      }
+    },
+    {
+      "name": "get_portfolio_state",
+      "type": "database",
+      "config": {
+        "query": "SELECT available_capital, total_value, today_pnl_usdt, month_pnl_usdt, month_start_capital, consecutive_losses, last_loss_at, system_active, system_stop_reason FROM portfolio WHERE id = 1"
+      }
+    },
+    {
+      "name": "get_open_trades",
+      "type": "database",
+      "config": {
+        "query": "SELECT id, coin, direction, entry_price, position_size_usdt, current_stop, entry_time FROM trades WHERE status = 'open'"
+      }
+    },
+    {
+      "name": "get_recent_trades",
+      "type": "database",
+      "config": {
+        "query": "SELECT id, coin, pnl_usdt, exit_time, exit_reason FROM trades WHERE status = 'closed' AND exit_time > NOW() - INTERVAL '24 hours' ORDER BY exit_time DESC"
+      }
+    },
+    {
+      "name": "get_risk_config",
+      "type": "database",
+      "config": {
+        "query": "SELECT * FROM risk_config WHERE id = 1"
+      }
+    },
+    {
+      "name": "update_signal_status",
+      "type": "database",
+      "config": {
+        "query": "UPDATE signals SET status = $2, risk_checks = $3, rejection_reason = $4, decided_at = NOW() WHERE id = $1"
+      }
+    },
+    {
+      "name": "set_system_stop",
+      "type": "database",
+      "config": {
+        "query": "UPDATE portfolio SET system_active = false, system_stop_reason = $1, system_stop_until = $2, updated_at = NOW() WHERE id = 1"
+      }
+    }
+  ],
+  "output_schema": {
+    "type": "object",
+    "required": ["signal_id", "decision", "checks"],
+    "properties": {
+      "signal_id": { "type": "string" },
+      "decision": { "type": "string", "enum": ["approved", "rejected"] },
+      "checks": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "rule": { "type": "string" },
+            "passed": { "type": "boolean" },
+            "value": { "type": "string" },
+            "limit": { "type": "string" }
+          }
+        }
+      },
+      "rejection_reason": { "type": ["string", "null"] },
+      "system_stop": { "type": "boolean" },
+      "system_stop_reason": { "type": ["string", "null"] }
+    }
+  }
+}
