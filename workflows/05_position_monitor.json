@@ -1,0 +1,358 @@
+{
+  "name": "05 - Position Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/15 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "monitor-cron",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, coin, direction, entry_price, position_size_usdt, position_size_units, current_stop, initial_stop, trailing_atr_mult, trail_activation_pct, trailing_activated, highest_since_entry, lowest_since_entry, exchange_order_id FROM trades WHERE status = 'open'",
+        "options": {}
+      },
+      "id": "get-open-trades",
+      "name": "Get Open Trades",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "id": "has-open-trades",
+              "leftValue": "={{ $items().length }}",
+              "rightValue": 0,
+              "operator": {"type": "number", "operation": "gt"}
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-open-trades",
+      "name": "Has Open Trades?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop-trades",
+      "name": "Loop Trades",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [900, 180]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.binance.com/api/v3/ticker/price?symbol={{ $json.coin.replace('/', '') }}",
+        "options": {
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "fetch-price",
+      "name": "Fetch Current Price",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.binance.com/api/v3/klines?symbol={{ $('Loop Trades').item.json.coin.replace('/', '') }}&interval=4h&limit=20",
+        "options": {
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "fetch-atr",
+      "name": "Fetch Recent OHLCV for ATR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const trade = $('Loop Trades').item.json;\nconst priceData = $('Fetch Current Price').item.json;\nconst klines = $('Fetch Recent OHLCV for ATR').item.json;\n\nconst currentPrice = parseFloat(priceData.price);\n\n// Compute ATR14 from recent klines\nconst candles = klines.map(c => ({\n  high: parseFloat(c[2]),\n  low: parseFloat(c[3]),\n  close: parseFloat(c[4])\n}));\n\nfunction calcATR(candles, period) {\n  const tr = [];\n  for (let i = 1; i < candles.length; i++) {\n    tr.push(Math.max(\n      candles[i].high - candles[i].low,\n      Math.abs(candles[i].high - candles[i - 1].close),\n      Math.abs(candles[i].low - candles[i - 1].close)\n    ));\n  }\n  let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;\n  for (let i = period; i < tr.length; i++) {\n    atr = (atr * (period - 1) + tr[i]) / period;\n  }\n  return atr;\n}\n\nconst currentAtr14 = candles.length >= 15 ? calcATR(candles, 14) : null;\n\n// Check trailing stop\nconst entryPrice = parseFloat(trade.entry_price);\nconst currentStop = parseFloat(trade.current_stop);\nconst trailAtrMult = parseFloat(trade.trailing_atr_mult);\nconst trailActivation = parseFloat(trade.trail_activation_pct);\n\nlet result = {\n  trade_id: trade.id,\n  coin: trade.coin,\n  direction: trade.direction,\n  entry_price: entryPrice,\n  current_price: currentPrice,\n  current_stop: currentStop,\n  position_size_units: parseFloat(trade.position_size_units),\n  exchange_order_id: trade.exchange_order_id,\n  stop_hit: false,\n  stop_updated: false,\n  new_stop: currentStop,\n  action: 'none'\n};\n\nif (trade.direction === 'long') {\n  if (currentPrice <= currentStop) {\n    result.stop_hit = true;\n    result.exit_price = currentStop;\n    result.action = 'close';\n    return [{ json: result }];\n  }\n  const newHigh = Math.max(parseFloat(trade.highest_since_entry || entryPrice), currentPrice);\n  const profitPct = (currentPrice - entryPrice) / entryPrice;\n  if (profitPct >= trailActivation && currentAtr14) {\n    const newStop = newHigh - (trailAtrMult * currentAtr14);\n    if (newStop > currentStop) {\n      result.stop_updated = true;\n      result.new_stop = Math.round(newStop * 1e8) / 1e8;\n      result.highest_since_entry = newHigh;\n      result.action = 'update_stop';\n    }\n  }\n} else if (trade.direction === 'short') {\n  if (currentPrice >= currentStop) {\n    result.stop_hit = true;\n    result.exit_price = currentStop;\n    result.action = 'close';\n    return [{ json: result }];\n  }\n  const newLow = Math.min(parseFloat(trade.lowest_since_entry || entryPrice), currentPrice);\n  const profitPct = (entryPrice - currentPrice) / entryPrice;\n  if (profitPct >= trailActivation && currentAtr14) {\n    const newStop = newLow + (trailAtrMult * currentAtr14);\n    if (newStop < currentStop) {\n      result.stop_updated = true;\n      result.new_stop = Math.round(newStop * 1e8) / 1e8;\n      result.lowest_since_entry = newLow;\n      result.action = 'update_stop';\n    }\n  }\n}\n\nreturn [{ json: result }];\n"
+      },
+      "id": "check-trailing",
+      "name": "Check Trailing Stop",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+                "conditions": [{"id": "sw-close", "leftValue": "={{ $json.action }}", "rightValue": "close", "operator": {"type": "string", "operation": "equals"}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "close"
+            },
+            {
+              "conditions": {
+                "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+                "conditions": [{"id": "sw-update", "leftValue": "={{ $json.action }}", "rightValue": "update_stop", "operator": {"type": "string", "operation": "equals"}}],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "update"
+            }
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "id": "switch-action",
+      "name": "Switch Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1780, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst side = d.direction === 'long' ? 'SELL' : 'BUY';\nconst timestamp = Date.now();\nconst qty = Math.floor(d.position_size_units * 1e8) / 1e8;\nconst queryString = `symbol=${d.coin.replace('/', '')}&side=${side}&type=MARKET&quantity=${qty}&timestamp=${timestamp}`;\nconst crypto = require('crypto');\nconst signature = crypto.createHmac('sha256', $env.BINANCE_API_SECRET).update(queryString).digest('hex');\nreturn [{ json: { ...d, queryString, signature } }];\n"
+      },
+      "id": "build-close-order",
+      "name": "Build Close Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.binance.com/api/v3/order",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{"name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}"}]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "body": "={{ $json.queryString + '&signature=' + $json.signature }}",
+        "options": {}
+      },
+      "id": "close-order",
+      "name": "Close Position on Binance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 60]
+    },
+    {
+      "parameters": {
+        "jsCode": "const closeResp = $input.first().json;\nconst tradeData = $('Build Close Order').first().json;\n\nconst fills = closeResp.fills || [];\nconst totalQty = fills.reduce((s, f) => s + parseFloat(f.qty), 0);\nconst totalVal = fills.reduce((s, f) => s + parseFloat(f.qty) * parseFloat(f.price), 0);\nconst exitPrice = totalQty > 0 ? totalVal / totalQty : tradeData.current_price;\n\nconst pnlUsdt = tradeData.direction === 'long'\n  ? (exitPrice - tradeData.entry_price) * totalQty\n  : (tradeData.entry_price - exitPrice) * totalQty;\nconst pnlPct = pnlUsdt / tradeData.position_size_usdt;\nconst isWin = pnlUsdt > 0;\n\nreturn [{ json: { ...tradeData, exitPrice, pnlUsdt, pnlPct, isWin, totalQty } }];\n"
+      },
+      "id": "calc-pnl",
+      "name": "Calculate PnL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 60]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE trades SET status = 'closed', exit_price = $2, exit_time = NOW(), exit_reason = 'trailing_stop', pnl_usdt = $3, pnl_pct = $4, updated_at = NOW() WHERE id = $1;\nSELECT update_portfolio_after_trade($3, $5, $6);",
+        "options": {
+          "queryReplacement": "={{ $json.trade_id }},={{ $json.exitPrice }},={{ $json.pnlUsdt }},={{ $json.pnlPct }},={{ $json.position_size_usdt || 0 }},={{ $json.isWin }}"
+        }
+      },
+      "id": "save-close",
+      "name": "Save Close to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2660, 60],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ ($('Calculate PnL').first().json.isWin ? '💚' : '💔') + ' *Obchod uzavřen — Trailing Stop*\\n\\n' + ($('Calculate PnL').first().json.direction === 'long' ? '🟢' : '🔴') + ' ' + $('Calculate PnL').first().json.coin + ' ' + $('Calculate PnL').first().json.direction.toUpperCase() + '\\nEntry: `' + $('Calculate PnL').first().json.entry_price + '` → Exit: `' + $('Calculate PnL').first().json.exitPrice.toFixed(8) + '`\\nP&L: ' + ($('Calculate PnL').first().json.pnlUsdt >= 0 ? '+' : '') + '$' + $('Calculate PnL').first().json.pnlUsdt.toFixed(2) + ' (' + ($('Calculate PnL').first().json.pnlPct >= 0 ? '+' : '') + ($('Calculate PnL').first().json.pnlPct * 100).toFixed(2) + '%)' }}",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "notify-closed",
+      "name": "Notify: Trade Closed",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2880, 60],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE trades SET current_stop = $2, trailing_activated = true, highest_since_entry = COALESCE($3, highest_since_entry), lowest_since_entry = COALESCE($4, lowest_since_entry), last_check_at = NOW(), updated_at = NOW() WHERE id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.trade_id }},={{ $json.new_stop }},={{ $json.highest_since_entry || null }},={{ $json.lowest_since_entry || null }}"
+        }
+      },
+      "id": "update-stop",
+      "name": "Update Stop in DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2000, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE trades SET last_check_at = NOW() WHERE id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.trade_id }}"
+        }
+      },
+      "id": "update-check-time",
+      "name": "Update Check Time",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2000, 420],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "loop-continue-close",
+      "name": "Continue After Close",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3100, 60]
+    },
+    {
+      "parameters": {},
+      "id": "loop-continue-update",
+      "name": "Continue After Update",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {},
+      "id": "loop-continue-noop",
+      "name": "Continue No Change",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2220, 420]
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [[{"node": "Get Open Trades", "type": "main", "index": 0}]]
+    },
+    "Get Open Trades": {
+      "main": [[{"node": "Has Open Trades?", "type": "main", "index": 0}]]
+    },
+    "Has Open Trades?": {
+      "main": [
+        [{"node": "Loop Trades", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Loop Trades": {
+      "main": [
+        [{"node": "Fetch Current Price", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Fetch Current Price": {
+      "main": [[{"node": "Fetch Recent OHLCV for ATR", "type": "main", "index": 0}]]
+    },
+    "Fetch Recent OHLCV for ATR": {
+      "main": [[{"node": "Check Trailing Stop", "type": "main", "index": 0}]]
+    },
+    "Check Trailing Stop": {
+      "main": [[{"node": "Switch Action", "type": "main", "index": 0}]]
+    },
+    "Switch Action": {
+      "main": [
+        [{"node": "Build Close Order", "type": "main", "index": 0}],
+        [{"node": "Update Stop in DB", "type": "main", "index": 0}],
+        [{"node": "Update Check Time", "type": "main", "index": 0}]
+      ]
+    },
+    "Build Close Order": {
+      "main": [[{"node": "Close Position on Binance", "type": "main", "index": 0}]]
+    },
+    "Close Position on Binance": {
+      "main": [[{"node": "Calculate PnL", "type": "main", "index": 0}]]
+    },
+    "Calculate PnL": {
+      "main": [[{"node": "Save Close to DB", "type": "main", "index": 0}]]
+    },
+    "Save Close to DB": {
+      "main": [[{"node": "Notify: Trade Closed", "type": "main", "index": 0}]]
+    },
+    "Notify: Trade Closed": {
+      "main": [[{"node": "Continue After Close", "type": "main", "index": 0}]]
+    },
+    "Continue After Close": {
+      "main": [[{"node": "Loop Trades", "type": "main", "index": 0}]]
+    },
+    "Update Stop in DB": {
+      "main": [[{"node": "Continue After Update", "type": "main", "index": 0}]]
+    },
+    "Continue After Update": {
+      "main": [[{"node": "Loop Trades", "type": "main", "index": 0}]]
+    },
+    "Update Check Time": {
+      "main": [[{"node": "Continue No Change", "type": "main", "index": 0}]]
+    },
+    "Continue No Change": {
+      "main": [[{"node": "Loop Trades", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "05-position-monitor",
+  "tags": [{"name": "algotrader"}]
+}

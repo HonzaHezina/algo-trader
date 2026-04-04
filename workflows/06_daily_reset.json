@@ -1,0 +1,115 @@
+{
+  "name": "06 - Daily Reset",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 * * *"
+            }
+          ]
+        }
+      },
+      "id": "daily-cron",
+      "name": "Daily at Midnight UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT reset_daily_pnl()",
+        "options": {}
+      },
+      "id": "daily-reset-fn",
+      "name": "Reset Daily PnL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE portfolio SET system_stop_until = NULL WHERE system_stop_until IS NOT NULL AND system_stop_until <= NOW() AND system_stop_reason NOT LIKE '%manual%'",
+        "options": {}
+      },
+      "id": "clear-day-stop",
+      "name": "Clear Expired Day Stop",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'expired', expired_at = NOW() WHERE status IN ('candidate', 'analyzed') AND expires_at < NOW()",
+        "options": {}
+      },
+      "id": "expire-signals",
+      "name": "Expire Old Signals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, data, severity) VALUES ('daily_reset', jsonb_build_object('reset_at', NOW(), 'date', CURRENT_DATE), 'info')",
+        "options": {}
+      },
+      "id": "daily-audit-log",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily at Midnight UTC": {
+      "main": [[{"node": "Reset Daily PnL", "type": "main", "index": 0}]]
+    },
+    "Reset Daily PnL": {
+      "main": [[{"node": "Clear Expired Day Stop", "type": "main", "index": 0}]]
+    },
+    "Clear Expired Day Stop": {
+      "main": [[{"node": "Expire Old Signals", "type": "main", "index": 0}]]
+    },
+    "Expire Old Signals": {
+      "main": [[{"node": "Audit Log", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "06-daily-reset",
+  "tags": [{"name": "algotrader"}]
+}

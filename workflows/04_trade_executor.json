@@ -1,0 +1,222 @@
+{
+  "name": "04 - Trade Executor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "execute-trade",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "executor-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "execute-trade-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.id, s.coin, s.direction, s.entry_price, s.stop_loss, s.trailing_atr_mult, s.trail_activation_pct, s.position_size_usdt, s.risk_amount_usdt, s.created_at, s.expires_at FROM signals s WHERE s.id = $1 AND s.status = 'approved' AND s.expires_at > NOW()",
+        "options": {
+          "queryReplacement": "={{ $json.signal_id }}"
+        }
+      },
+      "id": "get-approved-signal",
+      "name": "Get Approved Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "id": "check-signal-valid",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {"type": "string", "operation": "notEmpty"}
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-valid-signal",
+      "name": "Signal Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT available_capital, system_active FROM portfolio WHERE id = 1",
+        "options": {}
+      },
+      "id": "check-portfolio",
+      "name": "Check Portfolio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 180],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const signal = $('Get Approved Signal').first().json;\nconst portfolio = $input.first().json;\n\nif (!portfolio.system_active) {\n  throw new Error('System is stopped — cannot execute trade');\n}\n\nconst available = parseFloat(portfolio.available_capital);\nconst size = parseFloat(signal.position_size_usdt);\n\nif (size > available) {\n  throw new Error(`Insufficient capital: need $${size}, have $${available}`);\n}\n\n// Build Binance order params\nconst symbol = signal.coin.replace('/', '');\nconst side = signal.direction === 'long' ? 'BUY' : 'SELL';\nconst timestamp = Date.now();\n\n// For LONG: buy with USDT (quoteOrderQty)\n// For SHORT: sell base asset (requires existing position — spot only)\nconst sizeRounded = Math.floor(size * 100) / 100;\nconst queryString = `symbol=${symbol}&side=${side}&type=MARKET&quoteOrderQty=${sizeRounded}&timestamp=${timestamp}`;\n\nconst crypto = require('crypto');\nconst signature = crypto.createHmac('sha256', $env.BINANCE_API_SECRET)\n  .update(queryString)\n  .digest('hex');\n\nreturn [{ json: { signal, portfolio, queryString, signature, symbol, side, timestamp, sizeRounded } }];\n"
+      },
+      "id": "build-order",
+      "name": "Build Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.binance.com/api/v3/order",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-MBX-APIKEY", "value": "={{ $env.BINANCE_API_KEY }}"}
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "body": "={{ $json.queryString + '&signature=' + $json.signature }}",
+        "options": {
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "binance-order",
+      "name": "Place Binance Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const orderResponse = $input.first().json;\nconst signal = $('Build Order').first().json.signal;\n\n// Verify order was filled\nif (orderResponse.status !== 'FILLED') {\n  throw new Error(`Order not filled: ${JSON.stringify(orderResponse)}`);\n}\n\nconst fills = orderResponse.fills || [];\nconst totalQty = fills.reduce((sum, f) => sum + parseFloat(f.qty), 0);\nconst totalCost = fills.reduce((sum, f) => sum + parseFloat(f.qty) * parseFloat(f.price), 0);\nconst avgPrice = totalQty > 0 ? totalCost / totalQty : parseFloat(signal.entry_price);\n\nreturn [{\n  json: {\n    signal_id: signal.id,\n    coin: signal.coin,\n    direction: signal.direction,\n    exchange_order_id: String(orderResponse.orderId),\n    entry_price: avgPrice,\n    position_size_usdt: parseFloat(signal.position_size_usdt),\n    position_size_units: totalQty,\n    initial_stop: parseFloat(signal.stop_loss),\n    current_stop: parseFloat(signal.stop_loss),\n    trailing_atr_mult: parseFloat(signal.trailing_atr_mult),\n    trail_activation_pct: parseFloat(signal.trail_activation_pct)\n  }\n}];\n"
+      },
+      "id": "process-fill",
+      "name": "Process Fill",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH new_trade AS (\n  INSERT INTO trades (signal_id, coin, direction, entry_price, entry_time, position_size_usdt, position_size_units, initial_stop, current_stop, trailing_atr_mult, trail_activation_pct, exchange_order_id, status)\n  VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, $11, 'open')\n  RETURNING id\n)\nUPDATE signals SET status = 'executed', executed_at = NOW() WHERE id = $1;\nUPDATE portfolio SET\n  available_capital = available_capital - $5,\n  locked_in_positions = locked_in_positions + $5,\n  updated_at = NOW()\nWHERE id = 1;",
+        "options": {
+          "queryReplacement": "={{ $json.signal_id }},={{ $json.coin }},={{ $json.direction }},={{ $json.entry_price }},={{ $json.position_size_usdt }},={{ $json.position_size_units }},={{ $json.initial_stop }},={{ $json.current_stop }},={{ $json.trailing_atr_mult }},={{ $json.trail_activation_pct }},={{ $json.exchange_order_id }}"
+        }
+      },
+      "id": "save-trade",
+      "name": "Save Trade to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1780, 180],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ '✅ *Obchod otevřen!*\\n\\n' + ($('Process Fill').first().json.direction === 'long' ? '🟢' : '🔴') + ' ' + $('Process Fill').first().json.coin + ' ' + $('Process Fill').first().json.direction.toUpperCase() + '\\n💰 Entry: `' + $('Process Fill').first().json.entry_price.toFixed(8) + '`\\n📊 Velikost: $' + $('Process Fill').first().json.position_size_usdt.toFixed(2) + '\\n🛑 Stop: `' + $('Process Fill').first().json.current_stop + '`' }}",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "notify-trade-opened",
+      "name": "Notify: Trade Opened",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2000, 180],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({status: 'executed', trade: $('Process Fill').first().json}) }}"
+      },
+      "id": "executor-respond-ok",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2220, 180]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"error\", \"message\": \"Signal expired or not found\"}"
+      },
+      "id": "executor-respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Get Approved Signal", "type": "main", "index": 0}]]
+    },
+    "Get Approved Signal": {
+      "main": [[{"node": "Signal Valid?", "type": "main", "index": 0}]]
+    },
+    "Signal Valid?": {
+      "main": [
+        [{"node": "Check Portfolio", "type": "main", "index": 0}],
+        [{"node": "Respond Error", "type": "main", "index": 0}]
+      ]
+    },
+    "Check Portfolio": {
+      "main": [[{"node": "Build Order", "type": "main", "index": 0}]]
+    },
+    "Build Order": {
+      "main": [[{"node": "Place Binance Order", "type": "main", "index": 0}]]
+    },
+    "Place Binance Order": {
+      "main": [[{"node": "Process Fill", "type": "main", "index": 0}]]
+    },
+    "Process Fill": {
+      "main": [[{"node": "Save Trade to DB", "type": "main", "index": 0}]]
+    },
+    "Save Trade to DB": {
+      "main": [[{"node": "Notify: Trade Opened", "type": "main", "index": 0}]]
+    },
+    "Notify: Trade Opened": {
+      "main": [[{"node": "Respond OK", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "04-trade-executor",
+  "tags": [{"name": "algotrader"}]
+}

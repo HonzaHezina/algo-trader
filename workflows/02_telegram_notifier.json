@@ -1,0 +1,142 @@
+{
+  "name": "02 - Telegram Notifier",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "telegram-notify",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "notify-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "telegram-notify-webhook"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.id, s.coin, s.direction, s.trade_card, s.entry_price, s.stop_loss, s.trailing_atr_mult, s.trail_activation_pct, s.position_size_usdt, s.risk_amount_usdt, s.confidence_score, s.reasoning, s.created_at FROM signals s WHERE s.id = $1 AND s.status = 'approved'",
+        "options": {
+          "queryReplacement": "={{ $json.signal_id }}"
+        }
+      },
+      "id": "get-signal",
+      "name": "Get Approved Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "id": "check-signal-exists",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {"type": "string", "operation": "notEmpty"}
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-signal-exists",
+      "name": "Signal Exists?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $input.first().json;\n\nconst dirIcon  = s.direction === 'long' ? '🟢' : '🔴';\nconst dirLabel = s.direction === 'long' ? 'LONG' : 'SHORT';\nconst entry    = parseFloat(s.entry_price);\nconst stop     = parseFloat(s.stop_loss);\nconst riskPct  = (Math.abs(entry - stop) / entry * 100).toFixed(2);\nconst confPct  = Math.round(parseFloat(s.confidence_score) * 100);\nconst size     = parseFloat(s.position_size_usdt).toFixed(2);\nconst risk     = parseFloat(s.risk_amount_usdt).toFixed(2);\nconst trailMul = parseFloat(s.trailing_atr_mult);\nconst trailAct = Math.round(parseFloat(s.trail_activation_pct) * 100);\nconst shortId  = s.id.slice(0, 8);\n\nconst text = [\n  `${dirIcon} *${dirLabel} Setup — ${s.coin}*`,\n  ``,\n  `💰 Entry: \\`${entry}\\``,\n  `🛑 Stop Loss: \\`${stop}\\` (-${riskPct}%)`,\n  `📈 Trailing Stop: ${trailMul}× ATR (aktivuje po +${trailAct}%)`,\n  `📊 Pozice: $${size}`,\n  `⚠️  Risk: $${risk}`,\n  `🎯 Confidence: ${confPct}%`,\n  ``,\n  `💬 _${s.reasoning}_`,\n  ``,\n  `ID: \\`${shortId}\\``\n].join('\\n');\n\nconst reply_markup = JSON.stringify({\n  inline_keyboard: [[\n    { text: '✅ Approve', callback_data: `approve_${s.id}` },\n    { text: '❌ Reject',  callback_data: `reject_${s.id}` }\n  ]]\n});\n\nreturn [{ json: { text, reply_markup, signal_id: s.id } }];\n"
+      },
+      "id": "format-trade-card",
+      "name": "Format Trade Card",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": "={{ $json.reply_markup }}"
+        }
+      },
+      "id": "send-trade-card",
+      "name": "Send Trade Card",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1120, 200],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({status: 'sent', signal_id: $('Format Trade Card').first().json.signal_id}) }}"
+      },
+      "id": "notify-respond",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1340, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\": \"error\", \"message\": \"Signal not found or not approved\"}"
+      },
+      "id": "notify-respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 420]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Get Approved Signal", "type": "main", "index": 0}]]
+    },
+    "Get Approved Signal": {
+      "main": [[{"node": "Signal Exists?", "type": "main", "index": 0}]]
+    },
+    "Signal Exists?": {
+      "main": [
+        [{"node": "Format Trade Card", "type": "main", "index": 0}],
+        [{"node": "Respond Error", "type": "main", "index": 0}]
+      ]
+    },
+    "Format Trade Card": {
+      "main": [[{"node": "Send Trade Card", "type": "main", "index": 0}]]
+    },
+    "Send Trade Card": {
+      "main": [[{"node": "Respond OK", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "02-telegram-notifier",
+  "tags": [{"name": "algotrader"}]
+}

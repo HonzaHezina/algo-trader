@@ -1,0 +1,396 @@
+{
+  "name": "03 - Telegram Handler",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["message", "callback_query"],
+        "additionalFields": {}
+      },
+      "id": "tg-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const update = $input.first().json;\n\n// Verify chat_id matches authorized chat\nconst authorizedChatId = $env.TELEGRAM_CHAT_ID;\nconst chatId = String(\n  update.message?.chat?.id ||\n  update.callback_query?.message?.chat?.id ||\n  ''\n);\n\nif (chatId !== String(authorizedChatId)) {\n  return [{ json: { authorized: false, cmd: 'unauthorized', chatId } }];\n}\n\nlet cmd = 'unknown';\nlet signalId = null;\nlet callbackQueryId = null;\n\nif (update.callback_query) {\n  const data = update.callback_query.data || '';\n  callbackQueryId = update.callback_query.id;\n  if (data.startsWith('approve_')) {\n    cmd = 'approve';\n    signalId = data.replace('approve_', '');\n  } else if (data.startsWith('reject_')) {\n    cmd = 'reject';\n    signalId = data.replace('reject_', '');\n  }\n} else if (update.message?.text) {\n  const text = update.message.text.trim();\n  if (text === '/status')          cmd = 'status';\n  else if (text === '/trades')     cmd = 'trades';\n  else if (text === '/stop')       cmd = 'stop';\n  else if (text === '/start')      cmd = 'start';\n  else if (text.startsWith('/approve_')) {\n    cmd = 'approve';\n    signalId = text.replace('/approve_', '');\n  } else if (text.startsWith('/reject_')) {\n    cmd = 'reject';\n    signalId = text.replace('/reject_', '');\n  }\n}\n\nreturn [{ json: { authorized: true, cmd, signalId, chatId, callbackQueryId } }];\n"
+      },
+      "id": "parse-message",
+      "name": "Parse & Authorize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "id": "auth-check",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "true"}
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-authorized",
+      "name": "Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-approve", "leftValue": "={{ $json.cmd }}", "rightValue": "approve", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "approve"},
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-reject", "leftValue": "={{ $json.cmd }}", "rightValue": "reject", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "reject"},
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-status", "leftValue": "={{ $json.cmd }}", "rightValue": "status", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "status"},
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-trades", "leftValue": "={{ $json.cmd }}", "rightValue": "trades", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "trades"},
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-stop", "leftValue": "={{ $json.cmd }}", "rightValue": "stop", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "stop"},
+            {"conditions": {"options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"}, "conditions": [{"id": "sw-start", "leftValue": "={{ $json.cmd }}", "rightValue": "start", "operator": {"type": "string", "operation": "equals"}}], "combinator": "and"}, "renameOutput": true, "outputKey": "start"}
+          ]
+        },
+        "fallbackOutput": "extra"
+      },
+      "id": "switch-cmd",
+      "name": "Switch Command",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'approved', decided_at = NOW() WHERE id = $1 AND status = 'analyzed' RETURNING id, coin, direction, entry_price",
+        "options": {
+          "queryReplacement": "={{ $json.signalId }}"
+        }
+      },
+      "id": "db-approve",
+      "name": "DB: Approve Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 60],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_URL }}/webhook/telegram-notify",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ signal_id: $('Parse & Authorize').first().json.signalId }) }}",
+        "options": {}
+      },
+      "id": "trigger-notify",
+      "name": "Trigger Telegram Notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 60]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'rejected_by_user', decided_at = NOW() WHERE id = $1 RETURNING id, coin",
+        "options": {
+          "queryReplacement": "={{ $json.signalId }}"
+        }
+      },
+      "id": "db-reject",
+      "name": "DB: Reject Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 180],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "❌ Setup zamítnut",
+        "additionalFields": {}
+      },
+      "id": "reply-rejected",
+      "name": "Reply: Rejected",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1340, 180],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.total_value, p.available_capital, p.total_pnl_usdt, p.total_pnl_pct, p.today_pnl_usdt, p.total_trades, p.winning_trades, p.losing_trades, p.consecutive_losses, p.system_active, t.id, t.coin, t.direction, t.entry_price, t.current_stop, t.entry_time FROM portfolio p LEFT JOIN trades t ON t.status = 'open' WHERE p.id = 1",
+        "options": {}
+      },
+      "id": "db-status",
+      "name": "DB: Get Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(i => i.json);\nconst p = rows[0];\nconst openTrades = rows.filter(r => r.id !== null);\n\nconst sysIcon = p.system_active ? '⚡ AKTIVNÍ' : '⛔ ZASTAVEN';\nconst pnlSign = parseFloat(p.total_pnl_usdt) >= 0 ? '+' : '';\nconst todaySign = parseFloat(p.today_pnl_usdt) >= 0 ? '+' : '';\nconst pnlIcon = parseFloat(p.total_pnl_usdt) >= 0 ? '📈' : '📉';\nconst winRate = p.total_trades > 0 ? (p.winning_trades / p.total_trades * 100).toFixed(1) : 0;\n\nlet tradesSection = '';\nif (openTrades.length > 0) {\n  const lines = openTrades.map(t => {\n    const icon = t.direction === 'long' ? '🟢' : '🔴';\n    return `  ${icon} ${t.coin} ${t.direction.toUpperCase()} @ ${t.entry_price}\\n     Stop: ${t.current_stop}`;\n  });\n  tradesSection = `\\n📂 *Otevřené pozice: ${openTrades.length}/3*\\n${lines.join('\\n')}\\n`;\n} else {\n  tradesSection = '\\n📂 *Otevřené pozice: 0/3*\\n';\n}\n\nconst text = [\n  `📊 *Portfolio Status*`,\n  ``,\n  `💰 Kapitál: $${parseFloat(p.total_value).toFixed(2)}`,\n  `${pnlIcon} Celkový P&L: ${pnlSign}$${parseFloat(p.total_pnl_usdt).toFixed(2)} (${pnlSign}${parseFloat(p.total_pnl_pct).toFixed(2)}%)`,\n  `📅 Dnes: ${todaySign}$${parseFloat(p.today_pnl_usdt).toFixed(2)}`,\n  tradesSection,\n  `📊 Win Rate: ${winRate}% (${p.winning_trades}W / ${p.losing_trades}L)`,\n  `🔴 Consecutive losses: ${p.consecutive_losses}`,\n  `⚡ Systém: ${sysIcon}`\n].join('\\n');\n\nreturn [{ json: { text } }];\n"
+      },
+      "id": "format-status",
+      "name": "Format Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "reply-status",
+      "name": "Reply: Status",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT coin, direction, entry_price, exit_price, pnl_usdt, pnl_pct, exit_reason, exit_time FROM trades WHERE status = 'closed' ORDER BY exit_time DESC LIMIT 10",
+        "options": {}
+      },
+      "id": "db-trades",
+      "name": "DB: Last 10 Trades",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 420],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const trades = $input.all().map(i => i.json);\n\nif (trades.length === 0) {\n  return [{ json: { text: '📋 *Žádné uzavřené obchody*' } }];\n}\n\nconst lines = trades.map(t => {\n  const icon = parseFloat(t.pnl_usdt) >= 0 ? '🟢' : '🔴';\n  const pnlSign = parseFloat(t.pnl_usdt) >= 0 ? '+' : '';\n  const date = t.exit_time ? new Date(t.exit_time).toLocaleDateString('cs-CZ') : 'N/A';\n  return `${icon} ${t.coin} ${t.direction.toUpperCase()} | ${pnlSign}$${parseFloat(t.pnl_usdt).toFixed(2)} (${pnlSign}${parseFloat(t.pnl_pct).toFixed(2)}%) | ${date}`;\n});\n\nconst text = [`📋 *Posledních ${trades.length} obchodů*`, ``].concat(lines).join('\\n');\nreturn [{ json: { text } }];\n"
+      },
+      "id": "format-trades",
+      "name": "Format Trades",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "reply-trades",
+      "name": "Reply: Trades",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1560, 420],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE portfolio SET system_active = false, system_stop_reason = 'manual_stop', updated_at = NOW() WHERE id = 1",
+        "options": {}
+      },
+      "id": "db-stop",
+      "name": "DB: Stop System",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 540],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "⛔ *Systém zastaven.* Nové obchody nebudou otevírány.\nObnovení: /start",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "reply-stopped",
+      "name": "Reply: Stopped",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1340, 540],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE portfolio SET system_active = true, system_stop_reason = NULL, system_stop_until = NULL, updated_at = NOW() WHERE id = 1 AND system_stop_reason = 'manual_stop'",
+        "options": {}
+      },
+      "id": "db-start",
+      "name": "DB: Start System",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 660],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "✅ *Systém aktivován.* Scanner běží dle plánu.",
+        "additionalFields": {"parse_mode": "Markdown"}
+      },
+      "id": "reply-started",
+      "name": "Reply: Started",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1340, 660],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "❓ Neznámý příkaz.\n\nDostupné příkazy:\n/status — stav portfolia\n/trades — posledních 10 obchodů\n/stop — zastav systém\n/start — spusť systém",
+        "additionalFields": {}
+      },
+      "id": "reply-unknown",
+      "name": "Reply: Unknown",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1120, 780],
+      "credentials": {
+        "telegramApi": {
+          "id": "tg-cred-1",
+          "name": "AlgoTrader Telegram"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [[{"node": "Parse & Authorize", "type": "main", "index": 0}]]
+    },
+    "Parse & Authorize": {
+      "main": [[{"node": "Authorized?", "type": "main", "index": 0}]]
+    },
+    "Authorized?": {
+      "main": [
+        [{"node": "Switch Command", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Switch Command": {
+      "main": [
+        [{"node": "DB: Approve Signal", "type": "main", "index": 0}],
+        [{"node": "DB: Reject Signal", "type": "main", "index": 0}],
+        [{"node": "DB: Get Status", "type": "main", "index": 0}],
+        [{"node": "DB: Last 10 Trades", "type": "main", "index": 0}],
+        [{"node": "DB: Stop System", "type": "main", "index": 0}],
+        [{"node": "DB: Start System", "type": "main", "index": 0}],
+        [{"node": "Reply: Unknown", "type": "main", "index": 0}]
+      ]
+    },
+    "DB: Approve Signal": {
+      "main": [[{"node": "Trigger Telegram Notify", "type": "main", "index": 0}]]
+    },
+    "DB: Reject Signal": {
+      "main": [[{"node": "Reply: Rejected", "type": "main", "index": 0}]]
+    },
+    "DB: Get Status": {
+      "main": [[{"node": "Format Status", "type": "main", "index": 0}]]
+    },
+    "Format Status": {
+      "main": [[{"node": "Reply: Status", "type": "main", "index": 0}]]
+    },
+    "DB: Last 10 Trades": {
+      "main": [[{"node": "Format Trades", "type": "main", "index": 0}]]
+    },
+    "Format Trades": {
+      "main": [[{"node": "Reply: Trades", "type": "main", "index": 0}]]
+    },
+    "DB: Stop System": {
+      "main": [[{"node": "Reply: Stopped", "type": "main", "index": 0}]]
+    },
+    "DB: Start System": {
+      "main": [[{"node": "Reply: Started", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "03-telegram-handler",
+  "tags": [{"name": "algotrader"}]
+}

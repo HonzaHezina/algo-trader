@@ -1,0 +1,17 @@
+{
+  "name": "algo-trader",
+  "version": "1.0.0",
+  "description": "AI-powered crypto trading system — Scanner, Analyst, Risk Controller",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test tests/indicators.test.js tests/scanner.test.js tests/analyst.test.js tests/risk_controller.test.js",
+    "test:indicators": "node --test tests/indicators.test.js",
+    "test:scanner": "node --test tests/scanner.test.js",
+    "test:analyst": "node --test tests/analyst.test.js",
+    "test:risk": "node --test tests/risk_controller.test.js"
+  },
+  "devDependencies": {}
+}

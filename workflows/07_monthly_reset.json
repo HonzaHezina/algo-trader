@@ -1,0 +1,94 @@
+{
+  "name": "07 - Monthly Reset",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 1 * *"
+            }
+          ]
+        }
+      },
+      "id": "monthly-cron",
+      "name": "1st of Month at Midnight",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT reset_monthly_pnl()",
+        "options": {}
+      },
+      "id": "monthly-reset-fn",
+      "name": "Reset Monthly PnL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE portfolio SET system_active = true, system_stop_reason = NULL, system_stop_until = NULL, updated_at = NOW() WHERE system_stop_reason LIKE '%monthly_drawdown%'",
+        "options": {}
+      },
+      "id": "resume-after-drawdown",
+      "name": "Resume After Monthly Drawdown",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, data, severity) VALUES ('monthly_reset', jsonb_build_object('reset_at', NOW(), 'month', TO_CHAR(CURRENT_DATE, 'YYYY-MM')), 'info')",
+        "options": {}
+      },
+      "id": "monthly-audit-log",
+      "name": "Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "pg-cred-1",
+          "name": "AlgoTrader PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "1st of Month at Midnight": {
+      "main": [[{"node": "Reset Monthly PnL", "type": "main", "index": 0}]]
+    },
+    "Reset Monthly PnL": {
+      "main": [[{"node": "Resume After Monthly Drawdown", "type": "main", "index": 0}]]
+    },
+    "Resume After Monthly Drawdown": {
+      "main": [[{"node": "Audit Log", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "07-monthly-reset",
+  "tags": [{"name": "algotrader"}]
+}

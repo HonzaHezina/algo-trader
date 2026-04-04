@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    ports:
+      - "5432:5432"
     environment:
       POSTGRES_DB: algotrader
       POSTGRES_USER: algotrader
@@ -14,9 +16,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   n8n:
     image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
     environment:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
@@ -27,17 +32,51 @@ services:
       - DB_POSTGRESDB_DATABASE=algotrader
       - DB_POSTGRESDB_USER=algotrader
       - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
-      - WEBHOOK_URL=https://n8n.${DOMAIN:-localhost}
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL:-https://n8n.localhost}
       - GENERIC_TIMEZONE=UTC
       - N8N_METRICS=true
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # OpenClaw URL and key for workflows
+      - OPENCLAW_API_URL=http://openclaw:18789
+      - OPENCLAW_API_KEY=${OPENCLAW_API_KEY}
+      # Binance and Telegram credentials for workflows
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TELEGRAM_ERROR_CHAT_ID=${TELEGRAM_ERROR_CHAT_ID}
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
       postgres:
         condition: service_healthy
-    expose:
-      - "5678"
+      openclaw:
+        condition: service_healthy
+    restart: unless-stopped
+
+  openclaw:
+    image: ghcr.io/openclaw/openclaw:latest
+    ports:
+      - "18789:18789"
+    environment:
+      - OPENCLAW_TOKEN=${OPENCLAW_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GENERIC_TIMEZONE=UTC
+    volumes:
+      - openclaw_data:/app/data
+      - ./agents/openclaw-workspace:/app/workspace:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:18789/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pg_data:
   n8n_data:
+  openclaw_data:

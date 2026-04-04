@@ -1,0 +1,631 @@
+{
+  "name": "01 - Scanner Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {"field": "cronExpression", "expression": "0 */4 * * *"}
+          ]
+        }
+      },
+      "id": "scanner-cron",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM portfolio WHERE id = 1 AND system_active = true",
+        "options": {}
+      },
+      "id": "check-system-active",
+      "name": "System Active?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "sys-active-check", "leftValue": "={{ $json.id }}", "rightValue": 1, "operator": {"type": "number", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "if-system-active",
+      "name": "If System Active",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT symbol, display_name FROM watchlist WHERE is_active = true ORDER BY symbol",
+        "options": {}
+      },
+      "id": "get-watchlist",
+      "name": "Get Watchlist",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 280],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop-coins",
+      "name": "Loop Coins",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1120, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.binance.com/api/v3/klines?symbol={{ $json.symbol }}&interval=4h&limit=200",
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "fetch-ohlcv",
+      "name": "Fetch OHLCV",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform raw Binance klines + attach coin context\nconst rawKlines = $input.first().json;\nconst coin = $('Loop Coins').item.json;\n\nif (!Array.isArray(rawKlines) || rawKlines.length < 50) {\n  return [{ json: { skip: true, symbol: coin.symbol, reason: 'insufficient_data' } }];\n}\n\nconst candles = rawKlines.map(c => ({\n  timestamp: new Date(c[0]).toISOString(),\n  open:   parseFloat(c[1]),\n  high:   parseFloat(c[2]),\n  low:    parseFloat(c[3]),\n  close:  parseFloat(c[4]),\n  volume: parseFloat(c[5])\n}));\n\n// Validate — skip candles with zero/NaN prices\nconst valid = candles.every(c => c.close > 0 && isFinite(c.close));\nif (!valid) {\n  return [{ json: { skip: true, symbol: coin.symbol, reason: 'invalid_candles' } }];\n}\n\nreturn [{ json: { candles, symbol: coin.symbol, display_name: coin.display_name, skip: false } }];\n"
+      },
+      "id": "transform-ohlcv",
+      "name": "Transform OHLCV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nif (d.skip) {\n  return [{ json: { is_signal: false, symbol: d.symbol } }];\n}\n\nconst candles = d.candles;\nconst closes  = candles.map(c => c.close);\nconst highs   = candles.map(c => c.high);\nconst lows    = candles.map(c => c.low);\nconst volumes = candles.map(c => c.volume);\nconst n = closes.length;\n\n// ATR (Wilder's smoothing)\nfunction calcATR(highs, lows, closes, period) {\n  const tr = [];\n  for (let i = 1; i < closes.length; i++) {\n    tr.push(Math.max(\n      highs[i] - lows[i],\n      Math.abs(highs[i] - closes[i-1]),\n      Math.abs(lows[i] - closes[i-1])\n    ));\n  }\n  let atr = tr.slice(0, period).reduce((a, b) => a + b, 0) / period;\n  for (let i = period; i < tr.length; i++) {\n    atr = (atr * (period - 1) + tr[i]) / period;\n  }\n  return atr;\n}\n\nconst atr14 = calcATR(highs, lows, closes, 14);\nconst atr7  = calcATR(highs, lows, closes, 7);\n\n// Highest High / Lowest Low over last 30 candles (excluding current)\nconst hh30 = Math.max(...highs.slice(-31, -1));\nconst ll30 = Math.min(...lows.slice(-31, -1));\n\n// Rate of Change (12 periods)\nconst roc12 = (closes[n-1] - closes[n-13]) / closes[n-13];\n\n// Volume SMA 20\nconst volSma20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;\nconst latestVol = volumes[n-1];\nconst volumeRatio = latestVol / volSma20;\n\nreturn [{ json: {\n  symbol: d.symbol,\n  display_name: d.display_name,\n  latest_close: closes[n-1],\n  latest_volume: latestVol,\n  atr14, atr7, hh30, ll30, roc12,\n  vol_sma20: volSma20,\n  volume_ratio: volumeRatio\n}}];\n"
+      },
+      "id": "compute-indicators",
+      "name": "Compute Indicators",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst { latest_close, latest_volume, hh30, ll30, roc12, vol_sma20, volume_ratio, atr14, atr7, symbol, display_name } = d;\n\nlet signal = null;\n\n// LONG breakout\nif (latest_close > hh30 && roc12 > 0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'long',\n    signal_type: 'breakout_high',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(hh30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    timestamp: new Date().toISOString()\n  };\n}\n\n// SHORT breakout\nif (!signal && latest_close < ll30 && roc12 < -0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'short',\n    signal_type: 'breakout_low',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(ll30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    timestamp: new Date().toISOString()\n  };\n}\n\nif (!signal) {\n  signal = { is_signal: false, symbol };\n}\n\nreturn [{ json: signal }];\n"
+      },
+      "id": "check-breakout",
+      "name": "Check Breakout",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 160]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "is-signal", "leftValue": "={{ $json.is_signal }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "if-signal",
+      "name": "Is Signal?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2220, 160]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO signals (coin, direction, signal_type, signal_data, status, expires_at) VALUES ($1, $2, $3, $4::jsonb, 'candidate', NOW() + INTERVAL '30 minutes') ON CONFLICT DO NOTHING RETURNING id",
+        "options": {
+          "queryReplacement": "={{ $json.coin }},={{ $json.direction }},={{ $json.signal_type }},={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "save-signal",
+      "name": "Save Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 60],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {},
+      "id": "no-signal-noop",
+      "name": "No Signal",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2440, 260]
+    },
+    {
+      "parameters": {},
+      "id": "after-save-noop",
+      "name": "After Save",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2660, 160]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, coin, direction, signal_type, signal_data FROM signals WHERE status = 'candidate' AND expires_at > NOW() ORDER BY created_at ASC",
+        "options": {}
+      },
+      "id": "get-candidates",
+      "name": "Get Candidate Signals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 520],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "has-candidates", "leftValue": "={{ $items().length }}", "rightValue": 0, "operator": {"type": "number", "operation": "gt"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "if-candidates",
+      "name": "Any Candidates?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 520]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop-analyst",
+      "name": "Loop Analyst",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1340, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT available_capital, total_value, (SELECT COUNT(*) FROM trades WHERE status = 'open') as open_positions_count FROM portfolio WHERE id = 1",
+        "options": {}
+      },
+      "id": "get-portfolio-analyst",
+      "name": "Get Portfolio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const signal = $('Loop Analyst').item.json;\nconst portfolio = $input.first().json;\n\nconst message = JSON.stringify({\n  signal: {\n    id: signal.id,\n    coin: signal.coin,\n    direction: signal.direction,\n    signal_type: signal.signal_type,\n    ...signal.signal_data\n  },\n  portfolio: {\n    available_capital: parseFloat(portfolio.available_capital),\n    total_value: parseFloat(portfolio.total_value),\n    open_positions_count: parseInt(portfolio.open_positions_count)\n  },\n  mindsdb_prediction: null\n});\n\nreturn [{ json: { message, signal_id: signal.id } }];\n"
+      },
+      "id": "prepare-analyst-msg",
+      "name": "Prepare Analyst Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL }}/api/sessions/analyst-{{ $json.signal_id }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.message }) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "call-analyst",
+      "name": "Call Analyst (OpenClaw)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst signalId = $('Prepare Analyst Input').item.json.signal_id;\n\n// Extract agent response content\nconst content = response.message?.content ||\n                response.content ||\n                response.response ||\n                JSON.stringify(response);\n\nlet tradeCard;\ntry {\n  // Try direct parse\n  const trimmed = content.trim();\n  if (trimmed.startsWith('{')) {\n    tradeCard = JSON.parse(trimmed);\n  } else {\n    // Extract from text\n    const match = trimmed.match(/```(?:json)?\\s*([\\s\\S]+?)```/);\n    if (match) {\n      tradeCard = JSON.parse(match[1].trim());\n    } else {\n      const start = trimmed.indexOf('{');\n      const end = trimmed.lastIndexOf('}');\n      tradeCard = JSON.parse(trimmed.slice(start, end + 1));\n    }\n  }\n} catch (e) {\n  throw new Error(`Analyst response parse error for ${signalId}: ${e.message}`);\n}\n\nif (tradeCard.error) {\n  throw new Error(`Analyst error for ${signalId}: ${tradeCard.error}`);\n}\n\nreturn [{ json: { signalId, tradeCard } }];\n"
+      },
+      "id": "parse-analyst",
+      "name": "Parse Analyst Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'analyzed', trade_card = $2::jsonb, entry_price = $3, stop_loss = $4, trailing_atr_mult = $5, trail_activation_pct = $6, position_size_usdt = $7, risk_amount_usdt = $8, confidence_score = $9, reasoning = $10, analyzed_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.signalId }},={{ JSON.stringify($json.tradeCard) }},={{ $json.tradeCard.entry_price }},={{ $json.tradeCard.stop_loss }},={{ $json.tradeCard.trailing_atr_mult }},={{ $json.tradeCard.trail_activation_pct }},={{ $json.tradeCard.position_size_usdt }},={{ $json.tradeCard.risk_amount_usdt }},={{ $json.tradeCard.confidence_score }},={{ $json.tradeCard.reasoning }}"
+        }
+      },
+      "id": "update-signal-analyzed",
+      "name": "Update Signal: Analyzed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {},
+      "id": "analyst-loop-back",
+      "name": "Analyst Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2660, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.id, s.coin, s.direction, s.trade_card, s.entry_price, s.stop_loss, s.position_size_usdt, s.risk_amount_usdt, s.confidence_score, s.created_at, s.expires_at FROM signals s WHERE s.status = 'analyzed' AND s.expires_at > NOW() ORDER BY s.created_at ASC",
+        "options": {}
+      },
+      "id": "get-analyzed",
+      "name": "Get Analyzed Signals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 700],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "has-analyzed", "leftValue": "={{ $items().length }}", "rightValue": 0, "operator": {"type": "number", "operation": "gt"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "if-analyzed",
+      "name": "Any Analyzed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 700]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop-risk",
+      "name": "Loop Risk",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1340, 580]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.available_capital, p.total_value, p.today_pnl_usdt, p.month_pnl_usdt, p.month_start_capital, p.consecutive_losses, p.last_loss_at, p.system_active, t.id as trade_id, t.coin as trade_coin, t.direction as trade_direction, t.entry_price as trade_entry, t.position_size_usdt as trade_size, t.current_stop as trade_stop, rc.max_risk_per_trade_pct, rc.max_open_positions, rc.max_daily_loss_pct, rc.max_monthly_drawdown_pct, rc.max_position_size_pct, rc.min_capital, rc.cooldown_after_loss_hours, rc.max_consecutive_losses_pause, rc.signal_expiry_minutes FROM portfolio p CROSS JOIN risk_config rc LEFT JOIN trades t ON t.status = 'open' WHERE p.id = 1 AND rc.id = 1",
+        "options": {}
+      },
+      "id": "get-risk-data",
+      "name": "Get Risk Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 580],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const signal = $('Loop Risk').item.json;\nconst rows = $input.all().map(r => r.json);\n\n// Extract portfolio and risk config from first row\nconst r0 = rows[0];\nconst portfolio = {\n  available_capital: parseFloat(r0.available_capital),\n  total_value: parseFloat(r0.total_value),\n  today_pnl_usdt: parseFloat(r0.today_pnl_usdt),\n  month_pnl_usdt: parseFloat(r0.month_pnl_usdt),\n  month_start_capital: parseFloat(r0.month_start_capital),\n  consecutive_losses: parseInt(r0.consecutive_losses),\n  last_loss_at: r0.last_loss_at,\n  system_active: r0.system_active\n};\n\nconst risk_config = {\n  max_risk_per_trade_pct: parseFloat(r0.max_risk_per_trade_pct),\n  max_open_positions: parseInt(r0.max_open_positions),\n  max_daily_loss_pct: parseFloat(r0.max_daily_loss_pct),\n  max_monthly_drawdown_pct: parseFloat(r0.max_monthly_drawdown_pct),\n  max_position_size_pct: parseFloat(r0.max_position_size_pct),\n  min_capital: parseFloat(r0.min_capital),\n  cooldown_after_loss_hours: parseInt(r0.cooldown_after_loss_hours),\n  max_consecutive_losses_pause: parseInt(r0.max_consecutive_losses_pause),\n  signal_expiry_minutes: parseInt(r0.signal_expiry_minutes)\n};\n\nconst open_trades = rows\n  .filter(r => r.trade_id)\n  .map(r => ({\n    id: r.trade_id, coin: r.trade_coin,\n    direction: r.trade_direction,\n    entry_price: parseFloat(r.trade_entry),\n    position_size_usdt: parseFloat(r.trade_size),\n    current_stop: parseFloat(r.trade_stop)\n  }));\n\nconst tradeCard = signal.trade_card || {};\n\nconst message = JSON.stringify({\n  trade_card: {\n    signal_id: signal.id,\n    coin: signal.coin,\n    direction: signal.direction,\n    entry_price: parseFloat(signal.entry_price),\n    stop_loss: parseFloat(signal.stop_loss),\n    position_size_usdt: parseFloat(signal.position_size_usdt),\n    risk_amount_usdt: parseFloat(signal.risk_amount_usdt),\n    confidence_score: parseFloat(signal.confidence_score),\n    timestamp: signal.created_at,\n    ...tradeCard\n  },\n  portfolio,\n  open_trades,\n  recent_trades: [],\n  risk_config\n});\n\nreturn [{ json: { message, signal_id: signal.id } }];\n"
+      },
+      "id": "prepare-risk-msg",
+      "name": "Prepare Risk Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 580]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL }}/api/sessions/risk-{{ $json.signal_id }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.message }) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "call-risk",
+      "name": "Call Risk Controller (OpenClaw)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 580]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst signalId = $('Prepare Risk Input').item.json.signal_id;\n\nconst content = response.message?.content ||\n                response.content ||\n                response.response ||\n                JSON.stringify(response);\n\nlet decision;\ntry {\n  const trimmed = content.trim();\n  if (trimmed.startsWith('{')) {\n    decision = JSON.parse(trimmed);\n  } else {\n    const match = trimmed.match(/```(?:json)?\\s*([\\s\\S]+?)```/);\n    if (match) {\n      decision = JSON.parse(match[1].trim());\n    } else {\n      const start = trimmed.indexOf('{');\n      const end = trimmed.lastIndexOf('}');\n      decision = JSON.parse(trimmed.slice(start, end + 1));\n    }\n  }\n} catch (e) {\n  // Fail safe: reject on parse error\n  decision = {\n    signal_id: signalId,\n    decision: 'rejected',\n    checks: [],\n    rejection_reason: `Parse error: ${e.message}`,\n    system_stop: false,\n    system_stop_reason: null\n  };\n}\n\nreturn [{ json: { signalId, decision } }];\n"
+      },
+      "id": "parse-risk",
+      "name": "Parse Risk Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 580]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = $2, risk_checks = $3::jsonb, rejection_reason = $4, decided_at = NOW() WHERE id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.signalId }},={{ $json.decision.decision }},={{ JSON.stringify($json.decision.checks) }},={{ $json.decision.rejection_reason || null }}"
+        }
+      },
+      "id": "update-signal-decision",
+      "name": "Update Signal Decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 580],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "is-approved", "leftValue": "={{ $('Parse Risk Response').item.json.decision.decision }}", "rightValue": "approved", "operator": {"type": "string", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "if-approved",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2660, 580]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_URL }}/webhook/telegram-notify",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ signal_id: $('Parse Risk Response').item.json.signalId }) }}",
+        "options": {}
+      },
+      "id": "trigger-telegram",
+      "name": "Trigger Telegram Notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2880, 480]
+    },
+    {
+      "parameters": {},
+      "id": "risk-rejected-noop",
+      "name": "Risk Rejected",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2880, 680]
+    },
+    {
+      "parameters": {},
+      "id": "risk-loop-back",
+      "name": "Risk Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3100, 580]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, data, severity) VALUES ('scanner_run', jsonb_build_object('ran_at', NOW(), 'result', 'pipeline_complete'), 'info')",
+        "options": {}
+      },
+      "id": "audit-complete",
+      "name": "Audit: Pipeline Complete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 880],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, data, severity) VALUES ('scanner_run', jsonb_build_object('ran_at', NOW(), 'result', 'no_signals'), 'info')",
+        "options": {}
+      },
+      "id": "audit-no-signals",
+      "name": "Audit: No Signals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 880],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (event_type, data, severity) VALUES ('scanner_run', jsonb_build_object('ran_at', NOW(), 'result', 'system_stopped'), 'warning')",
+        "options": {}
+      },
+      "id": "audit-stopped",
+      "name": "Audit: System Stopped",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 520],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [[{"node": "System Active?", "type": "main", "index": 0}]]
+    },
+    "System Active?": {
+      "main": [[{"node": "If System Active", "type": "main", "index": 0}]]
+    },
+    "If System Active": {
+      "main": [
+        [{"node": "Get Watchlist", "type": "main", "index": 0}],
+        [{"node": "Audit: System Stopped", "type": "main", "index": 0}]
+      ]
+    },
+    "Get Watchlist": {
+      "main": [[{"node": "Loop Coins", "type": "main", "index": 0}]]
+    },
+    "Loop Coins": {
+      "main": [
+        [{"node": "Fetch OHLCV", "type": "main", "index": 0}],
+        [{"node": "Get Candidate Signals", "type": "main", "index": 0}]
+      ]
+    },
+    "Fetch OHLCV": {
+      "main": [[{"node": "Transform OHLCV", "type": "main", "index": 0}]]
+    },
+    "Transform OHLCV": {
+      "main": [[{"node": "Compute Indicators", "type": "main", "index": 0}]]
+    },
+    "Compute Indicators": {
+      "main": [[{"node": "Check Breakout", "type": "main", "index": 0}]]
+    },
+    "Check Breakout": {
+      "main": [[{"node": "Is Signal?", "type": "main", "index": 0}]]
+    },
+    "Is Signal?": {
+      "main": [
+        [{"node": "Save Signal", "type": "main", "index": 0}],
+        [{"node": "No Signal", "type": "main", "index": 0}]
+      ]
+    },
+    "Save Signal": {
+      "main": [[{"node": "After Save", "type": "main", "index": 0}]]
+    },
+    "After Save": {
+      "main": [[{"node": "Loop Coins", "type": "main", "index": 0}]]
+    },
+    "No Signal": {
+      "main": [[{"node": "Loop Coins", "type": "main", "index": 0}]]
+    },
+    "Get Candidate Signals": {
+      "main": [[{"node": "Any Candidates?", "type": "main", "index": 0}]]
+    },
+    "Any Candidates?": {
+      "main": [
+        [{"node": "Loop Analyst", "type": "main", "index": 0}],
+        [{"node": "Audit: No Signals", "type": "main", "index": 0}]
+      ]
+    },
+    "Loop Analyst": {
+      "main": [
+        [{"node": "Get Portfolio", "type": "main", "index": 0}],
+        [{"node": "Get Analyzed Signals", "type": "main", "index": 0}]
+      ]
+    },
+    "Get Portfolio": {
+      "main": [[{"node": "Prepare Analyst Input", "type": "main", "index": 0}]]
+    },
+    "Prepare Analyst Input": {
+      "main": [[{"node": "Call Analyst (OpenClaw)", "type": "main", "index": 0}]]
+    },
+    "Call Analyst (OpenClaw)": {
+      "main": [[{"node": "Parse Analyst Response", "type": "main", "index": 0}]]
+    },
+    "Parse Analyst Response": {
+      "main": [[{"node": "Update Signal: Analyzed", "type": "main", "index": 0}]]
+    },
+    "Update Signal: Analyzed": {
+      "main": [[{"node": "Analyst Loop Back", "type": "main", "index": 0}]]
+    },
+    "Analyst Loop Back": {
+      "main": [[{"node": "Loop Analyst", "type": "main", "index": 0}]]
+    },
+    "Get Analyzed Signals": {
+      "main": [[{"node": "Any Analyzed?", "type": "main", "index": 0}]]
+    },
+    "Any Analyzed?": {
+      "main": [
+        [{"node": "Loop Risk", "type": "main", "index": 0}],
+        [{"node": "Audit: Pipeline Complete", "type": "main", "index": 0}]
+      ]
+    },
+    "Loop Risk": {
+      "main": [
+        [{"node": "Get Risk Data", "type": "main", "index": 0}],
+        [{"node": "Audit: Pipeline Complete", "type": "main", "index": 0}]
+      ]
+    },
+    "Get Risk Data": {
+      "main": [[{"node": "Prepare Risk Input", "type": "main", "index": 0}]]
+    },
+    "Prepare Risk Input": {
+      "main": [[{"node": "Call Risk Controller (OpenClaw)", "type": "main", "index": 0}]]
+    },
+    "Call Risk Controller (OpenClaw)": {
+      "main": [[{"node": "Parse Risk Response", "type": "main", "index": 0}]]
+    },
+    "Parse Risk Response": {
+      "main": [[{"node": "Update Signal Decision", "type": "main", "index": 0}]]
+    },
+    "Update Signal Decision": {
+      "main": [[{"node": "Approved?", "type": "main", "index": 0}]]
+    },
+    "Approved?": {
+      "main": [
+        [{"node": "Trigger Telegram Notify", "type": "main", "index": 0}],
+        [{"node": "Risk Rejected", "type": "main", "index": 0}]
+      ]
+    },
+    "Trigger Telegram Notify": {
+      "main": [[{"node": "Risk Loop Back", "type": "main", "index": 0}]]
+    },
+    "Risk Rejected": {
+      "main": [[{"node": "Risk Loop Back", "type": "main", "index": 0}]]
+    },
+    "Risk Loop Back": {
+      "main": [[{"node": "Loop Risk", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "08-error-alert"
+  },
+  "id": "01-scanner-pipeline",
+  "tags": [{"name": "algotrader"}]
+}
