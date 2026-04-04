@@ -104,7 +104,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const d = $input.first().json;\nconst { latest_close, latest_volume, hh30, ll30, roc12, vol_sma20, volume_ratio, atr14, atr7, symbol, display_name } = d;\n\nlet signal = null;\n\n// LONG breakout\nif (latest_close > hh30 && roc12 > 0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'long',\n    signal_type: 'breakout_high',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(hh30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    timestamp: new Date().toISOString()\n  };\n}\n\n// SHORT breakout\nif (!signal && latest_close < ll30 && roc12 < -0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'short',\n    signal_type: 'breakout_low',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(ll30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    timestamp: new Date().toISOString()\n  };\n}\n\nif (!signal) {\n  signal = { is_signal: false, symbol };\n}\n\nreturn [{ json: signal }];\n"
+        "jsCode": "const d = $input.first().json;\nconst { latest_close, latest_volume, hh30, ll30, roc12, vol_sma20, volume_ratio, atr14, atr7, symbol, display_name } = d;\n\nlet signal = null;\n\n// LONG breakout\nif (latest_close > hh30 && roc12 > 0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'long',\n    signal_type: 'breakout_high',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(hh30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    latest_volume,\n    vol_sma20,\n    timestamp: new Date().toISOString()\n  };\n}\n\n// SHORT breakout\nif (!signal && latest_close < ll30 && roc12 < -0.02 && latest_volume > vol_sma20) {\n  signal = {\n    is_signal: true,\n    direction: 'short',\n    signal_type: 'breakout_low',\n    coin: display_name,\n    symbol,\n    current_price: latest_close,\n    breakout_level: Math.round(ll30 * 1e8) / 1e8,\n    momentum_roc12: Math.round(roc12 * 10000) / 10000,\n    volume_ratio: Math.round(volume_ratio * 100) / 100,\n    atr14: Math.round(atr14 * 1e8) / 1e8,\n    atr7: Math.round(atr7 * 1e8) / 1e8,\n    latest_volume,\n    vol_sma20,\n    timestamp: new Date().toISOString()\n  };\n}\n\nif (!signal) {\n  signal = { is_signal: false, symbol };\n}\n\nreturn [{ json: signal }];\n"
       },
       "id": "check-breakout",
       "name": "Check Breakout",
@@ -216,7 +216,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const signal = $('Loop Analyst').item.json;\nconst portfolio = $input.first().json;\n\nconst message = JSON.stringify({\n  signal: {\n    id: signal.id,\n    coin: signal.coin,\n    direction: signal.direction,\n    signal_type: signal.signal_type,\n    ...signal.signal_data\n  },\n  portfolio: {\n    available_capital: parseFloat(portfolio.available_capital),\n    total_value: parseFloat(portfolio.total_value),\n    open_positions_count: parseInt(portfolio.open_positions_count)\n  },\n  mindsdb_prediction: null\n});\n\nreturn [{ json: { message, signal_id: signal.id } }];\n"
+        "jsCode": "const signal = $('Loop Analyst').item.json;\nconst portfolio = $('Get Portfolio').first().json;\n\n// MindsDB prediction — null if MindsDB unavailable or disabled\nlet mindsdb_prediction = null;\ntry {\n  const mdbResult = $input.first().json;\n  if (mdbResult && !mdbResult.error && mdbResult.data && mdbResult.data.length > 0) {\n    const row = mdbResult.data[0];\n    if (row.direction) {\n      mindsdb_prediction = {\n        direction: row.direction,\n        confidence: row.confidence != null ? parseFloat(row.confidence) : null,\n        predicted_move_pct: row.predicted_move_pct != null ? parseFloat(row.predicted_move_pct) : null\n      };\n    }\n  }\n} catch (e) {\n  // MindsDB unavailable or disabled — continue with null\n}\n\nconst message = JSON.stringify({\n  signal: {\n    id: signal.id,\n    coin: signal.coin,\n    direction: signal.direction,\n    signal_type: signal.signal_type,\n    ...signal.signal_data\n  },\n  portfolio: {\n    available_capital: parseFloat(portfolio.available_capital),\n    total_value: parseFloat(portfolio.total_value),\n    open_positions_count: parseInt(portfolio.open_positions_count)\n  },\n  mindsdb_prediction\n});\n\nreturn [{ json: { message, signal_id: signal.id, mindsdb_prediction } }];\n"
       },
       "id": "prepare-analyst-msg",
       "name": "Prepare Analyst Input",
@@ -262,9 +262,9 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE signals SET status = 'analyzed', trade_card = $2::jsonb, entry_price = $3, stop_loss = $4, trailing_atr_mult = $5, trail_activation_pct = $6, position_size_usdt = $7, risk_amount_usdt = $8, confidence_score = $9, reasoning = $10, analyzed_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
+        "query": "UPDATE signals SET status = 'analyzed', trade_card = $2::jsonb, entry_price = $3, stop_loss = $4, trailing_atr_mult = $5, trail_activation_pct = $6, position_size_usdt = $7, risk_amount_usdt = $8, confidence_score = $9, reasoning = $10, mindsdb_prediction = $11::jsonb, analyzed_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1",
         "options": {
-          "queryReplacement": "={{ $json.signalId }},={{ JSON.stringify($json.tradeCard) }},={{ $json.tradeCard.entry_price }},={{ $json.tradeCard.stop_loss }},={{ $json.tradeCard.trailing_atr_mult }},={{ $json.tradeCard.trail_activation_pct }},={{ $json.tradeCard.position_size_usdt }},={{ $json.tradeCard.risk_amount_usdt }},={{ $json.tradeCard.confidence_score }},={{ $json.tradeCard.reasoning }}"
+          "queryReplacement": "={{ $json.signalId }},={{ JSON.stringify($json.tradeCard) }},={{ $json.tradeCard.entry_price }},={{ $json.tradeCard.stop_loss }},={{ $json.tradeCard.trailing_atr_mult }},={{ $json.tradeCard.trail_activation_pct }},={{ $json.tradeCard.position_size_usdt }},={{ $json.tradeCard.risk_amount_usdt }},={{ $json.tradeCard.confidence_score }},={{ $json.tradeCard.reasoning }},={{ JSON.stringify($json.tradeCard.mindsdb_prediction || $('Prepare Analyst Input').item.json.mindsdb_prediction || null) }}"
         }
       },
       "id": "update-signal-analyzed",
@@ -490,6 +490,31 @@
       "credentials": {
         "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
       }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $env.MINDSDB_HOST || 'mindsdb' }}:{{ $env.MINDSDB_PORT || '47334' }}/api/sql/query",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (() => { const s = $('Loop Analyst').item.json; const sd = s.signal_data || {}; return JSON.stringify({ query: `SELECT direction, confidence, predicted_move_pct FROM mindsdb.price_predictor WHERE close = ${sd.current_price || 0} AND volume = ${sd.latest_volume || 0} AND atr14 = ${sd.atr14 || 1} AND roc12 = ${sd.momentum_roc12 || 0} AND volume_ratio = ${sd.volume_ratio || 1} LIMIT 1` }); })() }}",
+        "options": {
+          "timeout": 10000,
+          "response": {"response": {"responseFormat": "json"}}
+        }
+      },
+      "id": "query-mindsdb",
+      "name": "Query MindsDB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "continueOnFail": true,
+      "position": [1780, 260]
     }
   ],
   "connections": {
@@ -557,6 +582,9 @@
       ]
     },
     "Get Portfolio": {
+      "main": [[{"node": "Query MindsDB", "type": "main", "index": 0}]]
+    },
+    "Query MindsDB": {
       "main": [[{"node": "Prepare Analyst Input", "type": "main", "index": 0}]]
     },
     "Prepare Analyst Input": {

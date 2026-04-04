@@ -45,6 +45,10 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - TELEGRAM_ERROR_CHAT_ID=${TELEGRAM_ERROR_CHAT_ID}
+      # MindsDB connection for workflows
+      - MINDSDB_HOST=mindsdb
+      - MINDSDB_PORT=47334
+      - MINDSDB_ENABLED=${MINDSDB_ENABLED:-false}
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
@@ -76,7 +80,29 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # MindsDB — optional Phase 2, ML price predictions
+  # Start manually: docker compose --profile mindsdb up -d mindsdb
+  mindsdb:
+    image: mindsdb/mindsdb:latest
+    profiles: ["mindsdb"]
+    ports:
+      - "47334:47334"
+      - "47335:47335"
+    environment:
+      - MINDSDB_DEFAULT_USER=${MINDSDB_USER:-mindsdb}
+      - MINDSDB_DEFAULT_PASSWORD=${MINDSDB_PASSWORD:-}
+    volumes:
+      - mindsdb_data:/root/mindsdb_storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:47334/api/util/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
 volumes:
   pg_data:
   n8n_data:
   openclaw_data:
+  mindsdb_data:
