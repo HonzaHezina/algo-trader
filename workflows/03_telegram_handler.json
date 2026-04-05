@@ -72,10 +72,11 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE signals SET status = 'approved', decided_at = NOW() WHERE id = $1 AND status = 'analyzed' RETURNING id, coin, direction, entry_price",
-        "options": {
-          "queryReplacement": "={{ $json.signalId }}"
-        }
+        "query": "UPDATE signals SET status = 'approved', decided_at = NOW() WHERE id = $1 AND status = 'analyzed' RETURNING id, symbol, direction, chain",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.signalId] }}"
+        },
+        "options": {}
       },
       "id": "db-approve",
       "name": "DB: Approve Signal",
@@ -91,18 +92,47 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "chain-is-solana", "leftValue": "={{ $json.chain }}", "rightValue": "solana", "operator": {"type": "string", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "route-by-chain",
+      "name": "Route by Chain",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_URL }}/webhook/dex-execute",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ signal_id: $json.id }) }}",
+        "options": {}
+      },
+      "id": "trigger-dex-executor",
+      "name": "Trigger DEX Executor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, -40]
+    },
+    {
+      "parameters": {
         "method": "POST",
         "url": "={{ $env.N8N_WEBHOOK_URL }}/webhook/telegram-notify",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ signal_id: $('Parse & Authorize').first().json.signalId }) }}",
+        "jsonBody": "={{ JSON.stringify({ signal_id: $json.id }) }}",
         "options": {}
       },
       "id": "trigger-notify",
-      "name": "Trigger Telegram Notify",
+      "name": "Trigger CEX Executor",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1340, 60]
+      "position": [1560, 140]
     },
     {
       "parameters": {
@@ -362,7 +392,13 @@
       ]
     },
     "DB: Approve Signal": {
-      "main": [[{"node": "Trigger Telegram Notify", "type": "main", "index": 0}]]
+      "main": [[{"node": "Route by Chain", "type": "main", "index": 0}]]
+    },
+    "Route by Chain": {
+      "main": [
+        [{"node": "Trigger DEX Executor", "type": "main", "index": 0}],
+        [{"node": "Trigger CEX Executor", "type": "main", "index": 0}]
+      ]
     },
     "DB: Reject Signal": {
       "main": [[{"node": "Reply: Rejected", "type": "main", "index": 0}]]

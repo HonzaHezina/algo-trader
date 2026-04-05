@@ -49,12 +49,17 @@ services:
       - MINDSDB_HOST=mindsdb
       - MINDSDB_PORT=47334
       - MINDSDB_ENABLED=${MINDSDB_ENABLED:-false}
+      # Solana DEX — Birdeye + Signer service
+      - BIRDEYE_API_KEY=${BIRDEYE_API_KEY}
+      - SOLANA_SIGNER_URL=http://solana-signer:3001
     volumes:
       - n8n_data:/home/node/.n8n
     depends_on:
       postgres:
         condition: service_healthy
       openclaw:
+        condition: service_healthy
+      solana-signer:
         condition: service_healthy
     restart: unless-stopped
 
@@ -78,6 +83,27 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Solana Signer — podepisuje Jupiter swap transakce
+  # Izolovaný microservice s přístupem k private key
+  solana-signer:
+    build:
+      context: ./services/solana-signer
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - SOLANA_PRIVATE_KEY=${SOLANA_PRIVATE_KEY}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - SIGNER_PORT=3001
+      - CONFIRMATION_LEVEL=${SOLANA_CONFIRMATION_LEVEL:-confirmed}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   # MindsDB — optional Phase 2, ML price predictions

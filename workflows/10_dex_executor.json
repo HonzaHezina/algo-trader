@@ -1,0 +1,332 @@
+{
+  "name": "10 - DEX Trade Executor (Solana/Jupiter)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dex-execute",
+        "options": {}
+      },
+      "id": "dex-exec-webhook",
+      "name": "DEX Execute Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 400],
+      "webhookId": "dex-execute"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.id, s.symbol, s.direction, s.signal_data, s.chain, w.token_address, w.quote_token_address, t.decimals, t.liquidity_usd FROM signals s LEFT JOIN watchlist w ON w.symbol = s.symbol AND w.chain = 'solana' LEFT JOIN dex_tokens t ON t.address = w.token_address WHERE s.id = $1 AND s.status = 'approved' AND s.chain = 'solana'",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.body.signal_id] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-get-signal",
+      "name": "Get Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "dex-signal-found", "leftValue": "={{ $json.id }}", "rightValue": "", "operator": {"type": "string", "operation": "notEmpty"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "dex-if-signal-valid",
+      "name": "Signal Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT usdc_balance, available_usdc, total_value_usdt, consecutive_losses, system_active FROM dex_portfolio WHERE id = 1",
+        "options": {}
+      },
+      "id": "dex-exec-get-portfolio",
+      "name": "Get Portfolio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 280],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute position size, slippage, and Jupiter quote URL\nconst signal    = $('Get Signal').first().json;\nconst portfolio = $('Get Portfolio').first().json;\n\nconst sd          = signal.signal_data || {};\nconst tradeCard   = sd.trade_card || sd;\n\n// Position size from Analyst trade card, capped at available USDC\nlet positionUsdt = parseFloat(tradeCard.position_size_usdt || sd.position_size_usdt || 50);\npositionUsdt     = Math.min(positionUsdt, parseFloat(portfolio.available_usdc || 0));\n\nif (positionUsdt < 5) {\n  throw new Error('Insufficient USDC balance for trade (< $5)');\n}\n\n// Dynamic slippage based on position vs pool liquidity\nconst liquidityUsd = parseFloat(signal.liquidity_usd || 0);\nlet slippageBps;\nif (!liquidityUsd || liquidityUsd <= 0) {\n  slippageBps = 200;\n} else {\n  const impact = positionUsdt / liquidityUsd;\n  if      (impact < 0.001) slippageBps = 30;\n  else if (impact < 0.005) slippageBps = 50;\n  else if (impact < 0.01)  slippageBps = 100;\n  else if (impact < 0.02)  slippageBps = 200;\n  else                     slippageBps = 300;\n}\n\nconst USDC_MINT      = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';\nconst amountLamports = Math.floor(positionUsdt * Math.pow(10, 6));\nconst outputMint     = signal.token_address;\n\nconst quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${USDC_MINT}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}&platformFeeBps=0`;\n\nreturn [{\n  json: {\n    signal_id:     signal.id,\n    symbol:        signal.symbol,\n    direction:     signal.direction,\n    token_address: signal.token_address,\n    decimals:      signal.decimals || 6,\n    liquidity_usd: liquidityUsd,\n    position_usdt: positionUsdt,\n    slippage_bps:  slippageBps,\n    quote_url:     quoteUrl,\n    entry_price:   parseFloat(tradeCard.entry_price || sd.entry_price || 0),\n    stop_loss:     parseFloat(tradeCard.stop_loss   || sd.stop_loss   || 0),\n    take_profit:   parseFloat(tradeCard.take_profit || sd.take_profit || 0)\n  }\n}];"
+      },
+      "id": "dex-calc-position",
+      "name": "Calc Position & Slippage",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.quote_url }}",
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-jupiter-quote",
+      "name": "Jupiter Quote",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Jupiter quote — check price impact, extract key fields\nconst quote    = $input.item.json;\nconst calcData = $('Calc Position & Slippage').item.json;\n\nif (!quote?.outAmount) {\n  throw new Error('Jupiter quote failed: no outAmount');\n}\n\nconst priceImpact = parseFloat(quote.priceImpactPct || 0);\nif (priceImpact > 3) {\n  throw new Error(`Price impact too high: ${priceImpact.toFixed(2)}% (max 3%)`);\n}\n\nconst decimals     = calcData.decimals;\nconst outputTokens = parseInt(quote.outAmount) / Math.pow(10, decimals);\nconst inputUsdc    = parseInt(quote.inAmount)  / Math.pow(10, 6);\nconst effectivePrice = outputTokens > 0 ? inputUsdc / outputTokens : 0;\n\nreturn [{\n  json: {\n    ...calcData,\n    quote_response:   quote,\n    input_amount:     parseInt(quote.inAmount),\n    output_amount:    parseInt(quote.outAmount),\n    output_tokens:    outputTokens,\n    effective_price:  effectivePrice,\n    price_impact_pct: priceImpact,\n    route_plan:       quote.routePlan?.map(r => r.swapInfo?.label).filter(Boolean) || []\n  }\n}];"
+      },
+      "id": "dex-validate-quote",
+      "name": "Validate Quote",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://quote-api.jup.ag/v6/swap",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ quoteResponse: $json.quote_response, userPublicKey: 'SIGNER_PUBKEY_PLACEHOLDER', wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }) }}",
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-build-swap-tx",
+      "name": "Build Swap Transaction",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get wallet public key from signer service health check\n// Note: in production, use the public key returned by GET /health at startup\n// For the swap tx, we need to replace SIGNER_PUBKEY_PLACEHOLDER with real key\nconst swapTxData  = $input.item.json;\nconst quoteData   = $('Validate Quote').item.json;\n\nif (!swapTxData?.swapTransaction) {\n  throw new Error('Jupiter swap build failed: no swapTransaction');\n}\n\nreturn [{\n  json: {\n    ...quoteData,\n    swap_transaction: swapTxData.swapTransaction,\n    last_valid_block_height: swapTxData.lastValidBlockHeight\n  }\n}];"
+      },
+      "id": "dex-prepare-sign",
+      "name": "Prepare for Signing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SOLANA_SIGNER_URL }}/sign-and-send",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ swapTransaction: $json.swap_transaction }) }}",
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-sign-and-send",
+      "name": "Sign & Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "dex-tx-ok", "leftValue": "={{ $json.ok }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "dex-if-tx-ok",
+      "name": "TX Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2440, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge signer response with trade data for DB save\nconst signerResp = $input.item.json;\nconst tradeData  = $('Prepare for Signing').item.json;\n\nreturn [{\n  json: {\n    signal_id:        tradeData.signal_id,\n    symbol:           tradeData.symbol,\n    direction:        tradeData.direction,\n    token_address:    tradeData.token_address,\n    decimals:         tradeData.decimals,\n    liquidity_usd:    tradeData.liquidity_usd,\n    position_usdt:    tradeData.position_usdt,\n    entry_price:      tradeData.effective_price,\n    stop_loss:        tradeData.stop_loss,\n    take_profit:      tradeData.take_profit,\n    slippage_bps:     tradeData.slippage_bps,\n    price_impact_pct: tradeData.price_impact_pct,\n    output_tokens:    tradeData.output_tokens,\n    route_plan:       tradeData.route_plan,\n    tx_signature:     signerResp.signature,\n    explorer_url:     signerResp.explorerUrl\n  }\n}];"
+      },
+      "id": "dex-merge-result",
+      "name": "Merge Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 160]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO trades (signal_id, symbol, direction, side, exchange, status, position_size_usdt, entry_price, stop_loss_price, take_profit_price, chain, dex, token_address, tx_signature, chain_data) VALUES ($1, $2, $3, 'buy', 'jupiter', 'open', $4, $5, $6, $7, 'solana', 'jupiter', $8, $9, $10::jsonb) RETURNING id",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.signal_id, $json.symbol, $json.direction, $json.position_usdt, $json.entry_price, $json.stop_loss, $json.take_profit, $json.token_address, $json.tx_signature, JSON.stringify({ slippage_bps: $json.slippage_bps, price_impact_pct: $json.price_impact_pct, output_tokens: $json.output_tokens, route_plan: $json.route_plan, decimals: $json.decimals })] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-save-trade",
+      "name": "Save Trade",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2880, 160],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE dex_portfolio SET available_usdc = available_usdc - $1, locked_in_positions = locked_in_positions + $1, total_trades = total_trades + 1, updated_at = NOW() WHERE id = 1",
+        "additionalFields": {
+          "queryReplacement": "={{ [$('Merge Result').first().json.position_usdt] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-update-portfolio",
+      "name": "Update Portfolio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3100, 160],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Send Telegram confirmation for successful DEX trade\nconst t  = $('Merge Result').first().json;\nconst ip = t.entry_price  < 0.001 ? t.entry_price.toFixed(8) : t.entry_price.toFixed(4);\nconst sl = t.stop_loss    < 0.001 ? t.stop_loss.toFixed(8)   : t.stop_loss.toFixed(4);\nconst tp = t.take_profit  < 0.001 ? t.take_profit.toFixed(8)  : t.take_profit.toFixed(4);\n\nconst lines = [\n  `✅ *DEX Trade Executed: ${t.symbol}*`,\n  `⚡ Solana/Jupiter`,\n  ``,\n  `Směr: *${t.direction?.toUpperCase()}*`,\n  `Vstupní cena: \\`${ip}\\``,\n  `SL: \\`${sl}\\`  |  TP: \\`${tp}\\``,\n  `Pozice: *$${t.position_usdt.toFixed(2)}*`,\n  `Slippage: ${t.slippage_bps}bps  |  Impact: ${t.price_impact_pct?.toFixed(3) || '?'}%`,\n  `Route: ${(t.route_plan || []).join(' → ') || 'direct'}`,\n  ``,\n  `📝 [Zkontroluj na Solscan](${t.explorer_url})`,\n  `TX: \\`${t.tx_signature?.substring(0, 20)}...\\``\n];\n\nreturn [{ json: { text: lines.join('\\n'), parse_mode: 'Markdown' } }];"
+      },
+      "id": "dex-compose-confirm",
+      "name": "Compose Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, text: $json.text, parse_mode: $json.parse_mode, disable_web_page_preview: true }) }}",
+        "options": {}
+      },
+      "id": "dex-send-confirm",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3320, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// TX failed on-chain — build error Telegram message\nconst signerResp = $input.item.json;\nconst tradeData  = $('Prepare for Signing').item.json;\n\nconst errMsg = signerResp.error || signerResp.txError || 'Unknown error';\nconst text = [\n  `❌ *DEX Trade FAILED: ${tradeData.symbol}*`,\n  ``,\n  `Chyba: \\`${errMsg}\\``,\n  `Signal ID: ${tradeData.signal_id}`,\n  `TX: ${signerResp.signature ? `\\`${signerResp.signature.substring(0, 20)}...\\`` : 'N/A'}`\n].join('\\n');\n\nreturn [{ json: { text, signal_id: tradeData.signal_id } }];"
+      },
+      "id": "dex-build-error",
+      "name": "Build Error Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'failed', signal_data = signal_data || jsonb_build_object('exec_error', $2::text) WHERE id = $1",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.signal_id, $json.text] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-mark-failed",
+      "name": "Mark Signal Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2880, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, text: $('Build Error Message').first().json.text, parse_mode: 'Markdown' }) }}",
+        "options": {}
+      },
+      "id": "dex-send-error",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3100, 400]
+    }
+  ],
+  "connections": {
+    "DEX Execute Webhook": {
+      "main": [[{"node": "Get Signal", "type": "main", "index": 0}]]
+    },
+    "Get Signal": {
+      "main": [[{"node": "Signal Valid?", "type": "main", "index": 0}]]
+    },
+    "Signal Valid?": {
+      "main": [
+        [{"node": "Get Portfolio", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Get Portfolio": {
+      "main": [[{"node": "Calc Position & Slippage", "type": "main", "index": 0}]]
+    },
+    "Calc Position & Slippage": {
+      "main": [[{"node": "Jupiter Quote", "type": "main", "index": 0}]]
+    },
+    "Jupiter Quote": {
+      "main": [[{"node": "Validate Quote", "type": "main", "index": 0}]]
+    },
+    "Validate Quote": {
+      "main": [[{"node": "Build Swap Transaction", "type": "main", "index": 0}]]
+    },
+    "Build Swap Transaction": {
+      "main": [[{"node": "Prepare for Signing", "type": "main", "index": 0}]]
+    },
+    "Prepare for Signing": {
+      "main": [[{"node": "Sign & Send", "type": "main", "index": 0}]]
+    },
+    "Sign & Send": {
+      "main": [[{"node": "TX Confirmed?", "type": "main", "index": 0}]]
+    },
+    "TX Confirmed?": {
+      "main": [
+        [{"node": "Merge Result", "type": "main", "index": 0}],
+        [{"node": "Build Error Message", "type": "main", "index": 0}]
+      ]
+    },
+    "Merge Result": {
+      "main": [[{"node": "Save Trade", "type": "main", "index": 0}]]
+    },
+    "Save Trade": {
+      "main": [[{"node": "Update Portfolio", "type": "main", "index": 0}]]
+    },
+    "Update Portfolio": {
+      "main": [[{"node": "Compose Confirmation", "type": "main", "index": 0}]]
+    },
+    "Compose Confirmation": {
+      "main": [[{"node": "Send Confirmation", "type": "main", "index": 0}]]
+    },
+    "Build Error Message": {
+      "main": [[{"node": "Mark Signal Failed", "type": "main", "index": 0}]]
+    },
+    "Mark Signal Failed": {
+      "main": [[{"node": "Send Error Alert", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["dex", "solana", "executor"]
+}

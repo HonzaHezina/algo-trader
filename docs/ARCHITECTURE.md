@@ -2,7 +2,7 @@
 
 ## Přehled komponent
 
-Systém se skládá z 6 runtime komponent, které komunikují přes PostgreSQL (sdílený stav) a n8n (orchestrace).
+Systém se skládá z 8 runtime komponent. Primární trading probíhá na Solana DEX (Birdeye + Jupiter). Binance slouží pouze pro finální výběr (offramp). Komunikace přes PostgreSQL (sdílený stav) a n8n (orchestrace).
 
 ## Komponenty
 
@@ -12,14 +12,17 @@ Systém se skládá z 6 runtime komponent, které komunikují přes PostgreSQL (
 
 **Trigger:** n8n cron každé 4 hodiny (0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC).
 
-**Vstup:**
-- Seznam sledovaných coinů z tabulky `watchlist`
+**Vstup (CEX):**
+- Seznam sledovaných coinů z tabulky `watchlist` (chain = 'cex')
 - Cenová data z Binance API (4h OHLCV, posledních 200 svíček)
-- Aktuální ATR14, volume SMA20 (počítá sám z OHLCV)
+
+**Vstup (DEX — Solana):**
+- Aktivní tokeny z `watchlist` (chain = 'solana') + metadata z `dex_tokens`
+- Cenová data z Birdeye API (4h OHLCV, endpoint `/defi/ohlcv`)
 
 **Výstup:**
 - Zápis do tabulky `signals` se statusem `candidate`
-- JSON objekt s: `coin`, `direction`, `signal_type`, `breakout_price`, `momentum`, `volume_ratio`, `atr14`, `timestamp`
+- JSON objekt s: `symbol`, `direction`, `signal_type`, `breakout_price`, `momentum`, `volume_ratio`, `atr14`, `chain`, `timestamp`
 
 **Logika detekce:**
 ```
@@ -34,7 +37,7 @@ SHORT signál:
   volume > volume_sma(20)
 ```
 
-**Nepočítá:** Entry/stop/TP ceny, position sizing, risk check — to dělá Analyst.
+**Chain-agnostický:** Stejná logika detekce pro CEX i DEX — liší se jen zdroj dat.
 
 ---
 
@@ -46,7 +49,7 @@ SHORT signál:
 
 **Vstup:**
 - Záznamy ze `signals` se statusem `candidate`
-- Cenová data z Binance API (pro přesné výpočty)
+- Stav portfolia (tabulka `portfolio` nebo `dex_portfolio` podle chain)
 - Volitelně: predikce z MindsDB (confidence, predicted_direction)
 
 **Výstup:**
@@ -56,20 +59,20 @@ SHORT signál:
 ```json
 {
   "signal_id": "uuid",
-  "coin": "SOL/USDT",
+  "symbol": "JUP",
+  "chain": "solana",
+  "token_address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
   "direction": "long",
   "timeframe": "4h",
-  "entry_price": 142.50,
-  "stop_loss": 135.20,
+  "entry_price": 0.92,
+  "stop_loss": 0.85,
   "take_profit": null,
   "trailing_stop_atr_mult": 2.5,
   "trail_activation_pct": 0.04,
-  "risk_per_unit_pct": 5.12,
-  "position_size_usdt": 390.00,
-  "risk_amount_usdt": 20.00,
-  "risk_reward_ratio": null,
+  "position_size_usdt": 40.00,
+  "risk_amount_usdt": 4.00,
   "confidence_score": 0.72,
-  "reasoning": "SOL prolomil 30-period high na zvýšeném volume (1.8x avg). ATR14 = $3.65. Momentum 12-period ROC = +4.2%.",
+  "suggested_slippage": 50,
   "mindsdb_prediction": {
     "direction": "bullish",
     "confidence": 0.68,
@@ -81,12 +84,9 @@ SHORT signál:
 **Výpočty:**
 ```
 initial_stop = entry_price - (2.0 × ATR14)           # long
-initial_stop = entry_price + (2.0 × ATR14)           # short
-trailing_stop_distance = 2.5 × ATR14                  # dynamický
 risk_per_unit_pct = abs(entry - stop) / entry × 100
-position_size = (capital × 0.02) / risk_per_unit_pct  # max risk $20 při $1000
-position_size = min(position_size, capital × 0.45)     # max 45% kapitálu
-risk_reward_ratio = null                               # trailing stop → R:R se počítá až ex-post
+position_size = (capital × 0.02) / risk_per_unit_pct
+position_size = min(position_size, capital × 0.45)    # max 45% kapitálu
 ```
 
 ---
@@ -99,7 +99,7 @@ risk_reward_ratio = null                               # trailing stop → R:R s
 
 **Vstup:**
 - Trade karta z Analyst agenta
-- Aktuální stav portfolia z tabulky `portfolio`
+- Aktuální stav portfolia (`portfolio` nebo `dex_portfolio`)
 - Otevřené pozice z tabulky `trades` (status = `open`)
 - Risk konfigurace z tabulky `risk_config`
 
@@ -114,187 +114,205 @@ max_risk_per_trade_pct: 2.0          # max ztráta na 1 obchod = 2% kapitálu
 max_open_positions: 3                 # max 3 souběžné pozice
 max_daily_loss_pct: 4.0              # max denní ztráta = 4% kapitálu
 max_monthly_drawdown_pct: 6.0        # po dosažení → systém STOP na zbytek měsíce
-min_risk_reward: 1.5                  # min odhadované R:R (pokud je spočitatelné)
 max_position_size_pct: 45.0          # max 45% kapitálu v jedné pozici
-max_correlation: 0.7                  # neotevírat 2 vysoce korelované pozice
 min_capital: 50.0                     # pod $50 → systém STOP
 cooldown_after_loss_hours: 4          # po ztrátě čekat min 4h
 max_consecutive_losses_pause: 4       # po 4 ztrátách za sebou → pauza 24h
 ```
 
-**Validační sekvence:**
-1. Check: je dost kapitálu? (`available_capital > position_size`)
-2. Check: nepřekračuje max risk? (`risk_amount <= capital * 0.02`)
-3. Check: nepřekračuje max pozice? (`count(open_trades) < 3`)
-4. Check: denní loss limit? (`today_losses < capital * 0.04`)
-5. Check: měsíční drawdown? (`month_drawdown < capital * 0.06`)
-6. Check: cooldown po ztrátě? (`last_loss_time + 4h < now`)
-7. Check: consecutive losses pause? (`consecutive_losses < 4`)
-8. Check: korelace s otevřenými? (zjednodušeně: neotevírat 2 pozice na stejném coinu)
-9. Pokud vše OK → `approved`
-10. Pokud cokoliv selže → `rejected` + důvod
+**Chain-agnostický:** Stejná pravidla pro CEX i DEX. DEX používá `dex_portfolio`.
 
 ---
 
-### 4. Notifier (n8n workflow)
+### 4. Telegram Handler (n8n workflow 03)
 
-**Účel:** Doručuje schválené trade karty uživateli přes Telegram a zpracovává odpovědi.
+**Účel:** Zpracovává příkazy uživatele. Routuje `/approve` na správný executor podle `signal.chain`.
 
-**Trigger:** n8n webhook — po Risk Controller approval.
+**Příkazy:**
+- `/approve_ID` → načte signal, zkontroluje chain, routuje na DEX nebo CEX executor
+- `/reject_ID` → zamítne signal
+- `/status` → stav portfolia (CEX) + balance
+- `/trades` → posledních 10 uzavřených obchodů
+- `/stop` / `/start` → systém on/off
 
-**Formát Telegram zprávy:**
-
+**Chain routing:**
 ```
-🟢 LONG Setup #1 — SOL/USDT
-
-Entry:      $142.50
-Stop Loss:  $135.20 (-5.1%)
-Trail:      2.5× ATR (aktivace na +4%)
-Risk:       $20.00 (2.0% portfolia)
-Pozice:     $390.00
-Confidence: 72%
-
-📊 SOL prolomil 30-period high na zvýšeném volume.
-🤖 MindsDB: bullish, +8.5% predikce
-
-/approve_1  /reject_1  /modify_1
+/approve_123
+    │
+    ▼
+Načti signal (id=123) → zjisti signal.chain
+    │
+    ├── chain = 'solana' → POST /webhook/dex-execute   (Workflow 10)
+    │
+    └── chain = 'cex'    → POST /webhook/telegram-notify (Workflow 04)
 ```
-
-**Zpracování odpovědí:**
-- `/approve_1` → spustí Executor workflow
-- `/reject_1` → update signal na `rejected_by_user`
-- `/modify_1` → odpoví s možnostmi úprav (stop, size)
-- Timeout 30 minut → auto-reject
 
 ---
 
-### 5. Executor (n8n workflow)
+### 5. CEX Executor (n8n workflow 04)
 
-**Účel:** Odesílá obchodní příkazy na burzu/DEX po schválení uživatelem.
+**Účel:** Odesílá market ordery na Binance po schválení uživatelem.
 
-**Trigger:** Telegram callback `/approve_X`
+**Trigger:** Webhook `POST /webhook/telegram-notify`
 
 **Sekvence:**
 1. Načti signal z DB
 2. Ověř, že cena se nepohnula víc než 1% od doby analýzy
-3. Pokud cena OK → pošli market order přes Binance API
+3. Pošli market order přes Binance API
 4. Zapiš do tabulky `trades` se statusem `open`
-5. Nastav initial stop-loss jako OCO order (pokud burza podporuje)
-6. Notifikuj uživatele: "✅ SOL/USDT LONG otevřen @ $142.50"
-7. Pokud cena NOT OK → notifikuj: "⚠️ Cena se pohnula, setup expiroval"
-
-**Binance API volání:**
-```
-POST /api/v3/order
-{
-  "symbol": "SOLUSDT",
-  "side": "BUY",
-  "type": "MARKET",
-  "quoteOrderQty": 390.00
-}
-```
+5. Notifikuj uživatele
 
 ---
 
-### 6. Monitor (n8n workflow)
+### 6. DEX Executor (n8n workflow 10)
 
-**Účel:** Každých 15 minut kontroluje otevřené pozice a spravuje trailing stopy.
+**Účel:** Exekuuje Solana DEX swap přes Jupiter po schválení uživatelem.
 
-**Trigger:** n8n cron každých 15 minut.
+**Trigger:** Webhook `POST /webhook/dex-execute`
 
-**Logika pro LONG pozici:**
-```python
-current_price = get_price(coin)
-current_high = get_candle_high(coin, "15m")
-
-# Aktualizace trailing stop
-if profit_pct >= trail_activation_pct:
-    new_stop = current_high - (trailing_atr_mult * current_atr14)
-    if new_stop > current_stop:
-        update_stop(trade_id, new_stop)
-        log("Trailing stop posunut na {new_stop}")
-
-# Kontrola stop-loss
-if current_price <= current_stop:
-    execute_market_sell(trade_id)
-    close_trade(trade_id, exit_price=current_price, reason="trailing_stop")
-    notify_user("🔴 SOL/USDT LONG uzavřen @ {price} — trailing stop")
-    update_portfolio()
-```
-
-**Po uzavření obchodu:**
-1. Zapiš exit do `trades` (exit_price, exit_time, pnl, reason)
-2. Aktualizuj `portfolio` (available_capital, total_pnl)
-3. Zapiš do `audit_log`
-4. Notifikuj uživatele s výsledkem
+**Sekvence:**
+1. Načti signal z DB (ověř chain = 'solana', status = 'approved')
+2. Načti DEX portfolio (available_usdc)
+3. Spočítej velikost pozice + dynamický slippage (30–300 bps podle poměru pozice/likviditě)
+4. Fetch Jupiter quote (`GET /v6/quote?inputMint=USDC&outputMint={token}`)
+5. Validuj quote (max price impact 3%)
+6. Fetch Jupiter swap transaction (`POST /v6/swap`)
+7. Pošli `POST /sign-and-send` na Solana Signer mikroservis
+8. Po potvrzení: ulož trade do `trades`, aktualizuj `dex_portfolio`
+9. Notifikuj uživatele s Solscan linkem
 
 ---
 
-## Datové toky — Sequence Diagram
+### 7. Solana Signer (mikroservis)
+
+**Účel:** Izolovaná bezpečná komponenta pro podepisování Solana transakcí. Hot wallet přístupný pouze tomuto servisu.
+
+**Proč separátní:** n8n Code Nodes nemohou používat npm balíčky jako `@solana/web3.js`.
+
+**Endpointy:**
+```
+GET  /health         → { ok, wallet: pubkey, timestamp }
+GET  /balance        → { ok, sol, usdc, wallet }
+POST /sign-and-send  → { ok, signature, explorerUrl }
+                       Body: { swapTransaction: "<base64>" }
+```
+
+**Build:** `node:20-alpine`, deps: `@solana/web3.js`, `bs58`, `express`
+
+**Env:** `SOLANA_PRIVATE_KEY` (base58), `SOLANA_RPC_URL`, `SIGNER_PORT=3001`
+
+---
+
+### 8. Monitor (n8n workflow 05)
+
+**Účel:** Každých 15 minut kontroluje otevřené CEX pozice a spravuje trailing stopy.
+
+**Note:** DEX pozice jsou monitorovány samostatně (TODO: workflow 11).
+
+---
+
+## Datové toky
+
+### CEX Flow (Binance)
 
 ```
 n8n Cron (4h)
     │
     ▼
-Scanner ──[candidates]──▶ DB (signals: candidate)
+Scanner [Binance OHLCV] ──▶ DB (signals)
     │
     ▼
-n8n Webhook
+Analyst + MindsDB (opt.) ──▶ DB (signals: analyzed)
     │
     ▼
-Analyst ──[trade cards]──▶ DB (signals: analyzed)
-    │                          │
-    │                    MindsDB (optional)
-    ▼
-n8n Webhook
+Risk Controller ──▶ DB (signals: approved)
     │
     ▼
-Risk Controller ──[approved/rejected]──▶ DB (signals: approved)
+Telegram trade karta ──▶ Uživatel
+    │                          │ /approve_ID
+    ▼                          ▼
+Workflow 03 (chain=cex) ──▶ Workflow 04 Executor ──▶ Binance API
     │
     ▼
-n8n Webhook
+DB (trades: open) ──▶ Monitor (15min) ──▶ Binance API
+```
+
+### DEX Flow (Solana)
+
+```
+n8n Cron (4h)
     │
     ▼
-Notifier ──[Telegram msg]──▶ Uživatel
-    │                            │
-    │                     /approve /reject
-    │                            │
-    ▼                            ▼
-n8n Telegram Bot ◀──────────────┘
+Workflow 09 [Birdeye OHLCV] ──▶ Scanner ──▶ Analyst ──▶ Risk Controller
     │
     ▼
-Executor ──[market order]──▶ Binance API
+DB (signals, chain='solana')
     │
     ▼
-DB (trades: open)
-    │
-    ▼
-Monitor (15 min cron) ──[trailing stop check]──▶ Binance API
-    │
-    ▼
-DB (trades: closed) ──▶ Notifier ──▶ Telegram
+Telegram DEX trade karta ──▶ Uživatel
+    │                              │ /approve_ID
+    ▼                              ▼
+Workflow 03 (chain=solana) ──▶ Workflow 10 DEX Executor
+    │                                    │
+    │                          Jupiter Quote API
+    │                                    │
+    │                          Solana Signer mikroservis
+    │                                    │
+    ▼                          Solana mainnet (tx confirmed)
+DB (trades: open, chain='solana')
+```
+
+---
+
+## Adresářová struktura
+
+```
+algo-trader/
+├── services/
+│   └── solana-signer/       ← Express mikroservis (signing)
+│       ├── index.js
+│       ├── package.json
+│       └── Dockerfile
+├── lib/
+│   ├── solana.js            ← Birdeye/Jupiter helpers
+│   └── utils.js             ← buildTradeCardMessage
+├── workflows/
+│   ├── 01_scanner_pipeline.json   ← CEX scanner
+│   ├── 03_telegram_handler.json   ← routing CEX/DEX
+│   ├── 04_trade_executor.json     ← CEX executor (Binance)
+│   ├── 09_dex_scanner.json        ← DEX scanner (Birdeye)
+│   └── 10_dex_executor.json       ← DEX executor (Jupiter)
+├── db/
+│   ├── migrations/
+│   │   ├── 001_init.sql           ← základní schéma
+│   │   └── 002_dex.sql            ← DEX rozšíření
+│   └── seeds/
+│       ├── default_config.sql     ← CEX watchlist + portfolio
+│       └── dex_watchlist.sql      ← SOL, JUP, RAY, ORCA tokeny
+└── tests/
+    ├── indicators.test.js
+    ├── analyst.test.js
+    ├── risk_controller.test.js
+    ├── mindsdb.test.js
+    └── solana.test.js             ← 47 testů pro lib/solana.js
 ```
 
 ---
 
 ## Environment & Deployment
 
-**Hetzner VPS (Coolify):**
-- PostgreSQL container
-- n8n container (s persistent storage)
-- OpenClaw agents (jako n8n code nodes nebo separátní kontejnery)
-- MindsDB container (volitelný, začni bez něj)
+**Docker Compose services:**
+- `postgres` — PostgreSQL 16
+- `n8n` — orchestrace workflows
+- `openclaw` — AI agenti (Scanner, Analyst, Risk Controller)
+- `solana-signer` — Solana tx signing (hot wallet)
+- `mindsdb` (opt.) — `docker compose --profile mindsdb up -d mindsdb`
 
-**Doporučený deployment order:**
-1. PostgreSQL + migrations
-2. n8n + základní workflows (scanner trigger, notifier)
-3. Scanner agent (nejjednodušší, ověří data pipeline)
-4. Analyst agent
-5. Risk Controller agent
-6. Executor + Monitor workflows
-7. MindsDB (až systém běží stabilně)
-
-**Monitoring:**
-- n8n execution log (built-in)
-- PostgreSQL `audit_log` tabulka
-- Telegram notifikace chyb do separátního kanálu
+**Deployment order:**
+1. PostgreSQL + migrations (001, 002)
+2. n8n + openclaw + solana-signer
+3. Import workflows (01–10)
+4. DEX scanner (09) — ověří Birdeye pipeline
+5. Telegram notifikace
+6. DEX executor (10) — ověří Jupiter + signer
+7. MindsDB (až vše jiné běží stabilně)

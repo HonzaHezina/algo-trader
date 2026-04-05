@@ -1,0 +1,456 @@
+{
+  "name": "09 - DEX Scanner Pipeline (Solana)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {"field": "cronExpression", "expression": "0 */4 * * *"}
+          ]
+        }
+      },
+      "id": "dex-scanner-cron",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM dex_portfolio WHERE id = 1 AND system_active = true",
+        "options": {}
+      },
+      "id": "dex-check-system-active",
+      "name": "DEX System Active?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 400],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "dex-sys-active-check", "leftValue": "={{ $json.id }}", "rightValue": 1, "operator": {"type": "number", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "dex-if-system-active",
+      "name": "If DEX Active",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT w.symbol, w.display_name, w.token_address, t.decimals, t.liquidity_usd FROM watchlist w LEFT JOIN dex_tokens t ON t.address = w.token_address WHERE w.chain = 'solana' AND w.is_active = true ORDER BY w.symbol",
+        "options": {}
+      },
+      "id": "dex-get-watchlist",
+      "name": "Get DEX Watchlist",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 280],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "dex-loop-tokens",
+      "name": "Loop Tokens",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1120, 280]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ (() => { const token = $json.token_address; const now = Math.floor(Date.now() / 1000); const timeFrom = now - (200 * 14400); return `https://public-api.birdeye.so/defi/ohlcv?address=${token}&type=4H&time_from=${timeFrom}&time_to=${now}`; })() }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-API-KEY", "value": "={{ $env.BIRDEYE_API_KEY }}"},
+            {"name": "x-chain", "value": "solana"}
+          ]
+        },
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-fetch-ohlcv",
+      "name": "Fetch Birdeye OHLCV",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Birdeye OHLCV + prepare Scanner payload\nconst loopItem    = $('Loop Tokens').item.json;\nconst rawResponse = $input.item.json;\n\n// Parse candles from Birdeye format\nconst items = rawResponse?.data?.items || [];\nif (items.length < 50) {\n  return []; // nedostatek dat → přeskočit token\n}\n\nconst candles = items.map(c => ({\n  timestamp: new Date(c.unixTime * 1000).toISOString(),\n  open:   parseFloat(c.open),\n  high:   parseFloat(c.high),\n  low:    parseFloat(c.low),\n  close:  parseFloat(c.close),\n  volume: parseFloat(c.volume)\n}));\n\n// Vypočítej SMA20 volume (průměr posledních 20 svíček)\nconst recentVolumes = candles.slice(-21, -1).map(c => c.volume);\nconst volSma20 = recentVolumes.reduce((a, b) => a + b, 0) / recentVolumes.length;\n\nreturn [{\n  json: {\n    symbol:        loopItem.symbol,\n    display_name:  loopItem.display_name,\n    token_address: loopItem.token_address,\n    decimals:      loopItem.decimals || 6,\n    liquidity_usd: loopItem.liquidity_usd || 0,\n    chain:         'solana',\n    candles,\n    latest_volume: candles[candles.length - 1]?.volume || 0,\n    vol_sma20\n  }\n}];"
+      },
+      "id": "dex-parse-candles",
+      "name": "Parse Candles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL }}/v1/agents/scanner/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "input", "value": "={{ JSON.stringify({ candles: $json.candles, symbol: $json.symbol, chain: 'solana', latest_volume: $json.latest_volume, vol_sma20: $json.vol_sma20 }) }}"}
+          ]
+        },
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-scanner-agent",
+      "name": "Scanner Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if scanner detected a breakout signal for this DEX token\nconst scannerOutput = $input.item.json;\nconst loopItem      = $('Loop Tokens').item.json;\n\nlet signal = null;\ntry {\n  const parsed = typeof scannerOutput.output === 'string'\n    ? JSON.parse(scannerOutput.output)\n    : scannerOutput.output;\n  if (parsed?.signal && parsed.signal !== 'none') {\n    signal = {\n      symbol:        loopItem.symbol,\n      display_name:  loopItem.display_name,\n      token_address: loopItem.token_address,\n      decimals:      loopItem.decimals || 6,\n      liquidity_usd: loopItem.liquidity_usd || 0,\n      chain:         'solana',\n      direction:     parsed.signal,\n      signal_data:   parsed\n    };\n  }\n} catch {}\n\nif (!signal) return [];\nreturn [{ json: signal }];"
+      },
+      "id": "dex-check-breakout",
+      "name": "Check Breakout",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 280]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO signals (symbol, direction, status, signal_data, chain) VALUES ($1, $2, 'pending', $3::jsonb, 'solana') RETURNING id, symbol, direction, signal_data, chain",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.symbol, $json.direction, JSON.stringify($json.signal_data)] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-save-signal",
+      "name": "Save Signal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2220, 280],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "dex-loop-analyst",
+      "name": "Loop Analyst",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [240, 700]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, usdc_balance as balance, available_usdc, total_value_usdt, total_pnl_usdt, today_pnl_usdt, month_pnl_usdt, month_start_usdc, total_trades, winning_trades, losing_trades, consecutive_losses, system_active, last_loss_at, today_date FROM dex_portfolio WHERE id = 1",
+        "options": {}
+      },
+      "id": "dex-get-portfolio",
+      "name": "Get DEX Portfolio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 700],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $env.MINDSDB_HOST || 'mindsdb' }}:{{ $env.MINDSDB_PORT || '47334' }}/api/sql/query",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ (() => { const s = $('Loop Analyst').item.json; const sd = s.signal_data || {}; return JSON.stringify({ query: `SELECT direction, confidence, predicted_move_pct FROM mindsdb.price_predictor WHERE close = ${sd.current_price || 0} AND volume = ${sd.latest_volume || 0} AND atr14 = ${sd.atr14 || 1} AND roc12 = ${sd.momentum_roc12 || 0} AND volume_ratio = ${sd.volume_ratio || 1} LIMIT 1` }); })() }}",
+        "options": {}
+      },
+      "id": "dex-query-mindsdb",
+      "name": "Query MindsDB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 700],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Připrav vstup pro Analyst agenta (DEX verze)\nconst signal     = $('Loop Analyst').item.json;\nconst portfolio  = $('Get DEX Portfolio').first().json;\n\n// MindsDB predikce (pokud dostupná)\nlet mindsdb_prediction = null;\ntry {\n  const mdbRaw = $input.first().json;\n  if (mdbRaw?.data?.length > 0) {\n    const row = mdbRaw.data[0];\n    if (row?.direction) {\n      mindsdb_prediction = {\n        direction:          row.direction,\n        confidence:         row.confidence != null ? parseFloat(row.confidence) : null,\n        predicted_move_pct: row.predicted_move_pct != null ? parseFloat(row.predicted_move_pct) : null\n      };\n    }\n  }\n} catch {}\n\nreturn [{\n  json: {\n    signal_id:         signal.id,\n    symbol:            signal.symbol,\n    display_name:      signal.display_name,\n    token_address:     signal.token_address,\n    decimals:          signal.decimals,\n    liquidity_usd:     signal.liquidity_usd,\n    chain:             'solana',\n    direction:         signal.direction,\n    signal_data:       signal.signal_data,\n    portfolio,\n    mindsdb_prediction\n  }\n}];"
+      },
+      "id": "dex-prepare-analyst",
+      "name": "Prepare Analyst Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 700]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL }}/v1/agents/analyst/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "input", "value": "={{ JSON.stringify($json) }}"}
+          ]
+        },
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-analyst-agent",
+      "name": "Analyst Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Analyst output → trade card (DEX)\nconst analystOutput  = $input.item.json;\nconst preparedInput  = $('Prepare Analyst Input').item.json;\n\nlet tradeCard = null;\ntry {\n  const parsed = typeof analystOutput.output === 'string'\n    ? JSON.parse(analystOutput.output)\n    : analystOutput.output;\n  tradeCard = {\n    ...parsed,\n    signal_id:         preparedInput.signal_id,\n    symbol:            preparedInput.symbol,\n    display_name:      preparedInput.display_name,\n    token_address:     preparedInput.token_address,\n    decimals:          preparedInput.decimals,\n    liquidity_usd:     preparedInput.liquidity_usd,\n    chain:             'solana',\n    mindsdb_prediction: preparedInput.mindsdb_prediction\n  };\n} catch { return []; }\n\nif (!tradeCard) return [];\nreturn [{ json: tradeCard }];"
+      },
+      "id": "dex-parse-analyst",
+      "name": "Parse Analyst",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 700]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'analyzed', signal_data = signal_data || $1::jsonb WHERE id = $2",
+        "additionalFields": {
+          "queryReplacement": "={{ [JSON.stringify({ trade_card: $json, mindsdb_prediction: $json.mindsdb_prediction || null }), $json.signal_id] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-update-signal-analyzed",
+      "name": "Update Signal: Analyzed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 700],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_API_URL }}/v1/agents/risk_controller/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {"name": "input", "value": "={{ JSON.stringify({ trade_card: $json, portfolio: $('Prepare Analyst Input').item.json.portfolio, chain: 'solana' }) }}"}
+          ]
+        },
+        "options": {"response": {"response": {"responseFormat": "json"}}}
+      },
+      "id": "dex-risk-controller",
+      "name": "Risk Controller",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 700]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Risk Controller output\nconst rcOutput    = $input.item.json;\nconst tradeCard   = $('Parse Analyst').item.json;\n\nlet rcResult = null;\ntry {\n  rcResult = typeof rcOutput.output === 'string'\n    ? JSON.parse(rcOutput.output)\n    : rcOutput.output;\n} catch { return []; }\n\nif (!rcResult) return [];\nreturn [{ json: { ...tradeCard, rc_decision: rcResult.decision, rc_reason: rcResult.reason, rc_data: rcResult } }];"
+      },
+      "id": "dex-parse-rc",
+      "name": "Parse RC Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 700]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [{"id": "dex-rc-approved", "leftValue": "={{ $json.rc_decision }}", "rightValue": "approved", "operator": {"type": "string", "operation": "equals"}}],
+          "combinator": "and"
+        }
+      },
+      "id": "dex-if-approved",
+      "name": "If Approved",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2220, 700]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'approved' WHERE id = $1",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.signal_id] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-update-signal-approved",
+      "name": "Update Signal: Approved",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 580],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE signals SET status = 'rejected', signal_data = signal_data || jsonb_build_object('rc_reason', $2::text) WHERE id = $1",
+        "additionalFields": {
+          "queryReplacement": "={{ [$json.signal_id, $json.rc_reason || 'risk rules'] }}"
+        },
+        "options": {}
+      },
+      "id": "dex-update-signal-rejected",
+      "name": "Update Signal: Rejected",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2440, 820],
+      "credentials": {
+        "postgres": {"id": "pg-cred-1", "name": "AlgoTrader PostgreSQL"}
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compose DEX trade card Telegram message\nconst tc = $input.item.json;\n\nconst dir     = tc.direction?.toUpperCase() || '?';\nconst dirEmoji = dir === 'LONG'  ? '📈' : dir === 'SHORT' ? '📉' : '⚠️';\nconst chain   = '⚡ Solana DEX';\n\nconst entry   = tc.entry_price      != null ? tc.entry_price.toFixed(6)      : '?';\nconst sl      = tc.stop_loss        != null ? tc.stop_loss.toFixed(6)        : '?';\nconst tp      = tc.take_profit      != null ? tc.take_profit.toFixed(6)      : '?';\nconst pos     = tc.position_size_usdt != null ? `$${tc.position_size_usdt.toFixed(2)}` : '?';\nconst rr      = tc.risk_reward_ratio  != null ? tc.risk_reward_ratio.toFixed(2) : '?';\nconst conf    = tc.confidence_score   != null ? `${(tc.confidence_score * 100).toFixed(0)}%` : '?';\nconst liq     = tc.liquidity_usd     != null ? `$${(tc.liquidity_usd / 1000).toFixed(0)}k` : '?';\nconst slipBps = tc.suggested_slippage || 50;\n\nconst lines = [\n  `${dirEmoji} *DEX Signal: ${tc.display_name || tc.symbol}*`,\n  `${chain}`,\n  ``,\n  `Směr: *${dir}*`,\n  `Vstup: \\`${entry}\\``,\n  `SL: \\`${sl}\\`  |  TP: \\`${tp}\\``,\n  `Pozice: *${pos}*  |  R:R ${rr}`,\n  `Likvidita poolu: ${liq}  |  Slippage: ${slipBps}bps`,\n  `Konfidenční skóre: ${conf}`,\n];\n\nif (tc.mindsdb_prediction?.direction) {\n  const movePct = tc.mindsdb_prediction.predicted_move_pct != null\n    ? `, ${tc.mindsdb_prediction.predicted_move_pct > 0 ? '+' : ''}${tc.mindsdb_prediction.predicted_move_pct}% predikce`\n    : '';\n  lines.push(`🤖 MindsDB: ${tc.mindsdb_prediction.direction}${movePct}`);\n}\n\nlines.push(``, `Token: \\`${tc.token_address}\\``);\nlines.push(`Signal ID: ${tc.signal_id}`);\nlines.push(``, `/approve_${tc.signal_id} | /reject_${tc.signal_id}`);\n\nreturn [{ json: { text: lines.join('\\n'), signal_id: tc.signal_id, parse_mode: 'Markdown' } }];"
+      },
+      "id": "dex-compose-message",
+      "name": "Compose Trade Card",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 580]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ chat_id: $env.TELEGRAM_CHAT_ID, text: $json.text, parse_mode: $json.parse_mode }) }}",
+        "options": {}
+      },
+      "id": "dex-send-telegram",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2880, 580]
+    }
+  ],
+  "connections": {
+    "Every 4 Hours": {
+      "main": [[{"node": "DEX System Active?", "type": "main", "index": 0}]]
+    },
+    "DEX System Active?": {
+      "main": [[{"node": "If DEX Active", "type": "main", "index": 0}]]
+    },
+    "If DEX Active": {
+      "main": [[{"node": "Get DEX Watchlist", "type": "main", "index": 0}]]
+    },
+    "Get DEX Watchlist": {
+      "main": [[{"node": "Loop Tokens", "type": "main", "index": 0}]]
+    },
+    "Loop Tokens": {
+      "main": [
+        [{"node": "Fetch Birdeye OHLCV", "type": "main", "index": 0}],
+        [{"node": "Loop Analyst", "type": "main", "index": 0}]
+      ]
+    },
+    "Fetch Birdeye OHLCV": {
+      "main": [[{"node": "Parse Candles", "type": "main", "index": 0}]]
+    },
+    "Parse Candles": {
+      "main": [[{"node": "Scanner Agent", "type": "main", "index": 0}]]
+    },
+    "Scanner Agent": {
+      "main": [[{"node": "Check Breakout", "type": "main", "index": 0}]]
+    },
+    "Check Breakout": {
+      "main": [[{"node": "Save Signal", "type": "main", "index": 0}]]
+    },
+    "Save Signal": {
+      "main": [[{"node": "Loop Tokens", "type": "main", "index": 0}]]
+    },
+    "Loop Analyst": {
+      "main": [
+        [{"node": "Get DEX Portfolio", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Get DEX Portfolio": {
+      "main": [[{"node": "Query MindsDB", "type": "main", "index": 0}]]
+    },
+    "Query MindsDB": {
+      "main": [[{"node": "Prepare Analyst Input", "type": "main", "index": 0}]]
+    },
+    "Prepare Analyst Input": {
+      "main": [[{"node": "Analyst Agent", "type": "main", "index": 0}]]
+    },
+    "Analyst Agent": {
+      "main": [[{"node": "Parse Analyst", "type": "main", "index": 0}]]
+    },
+    "Parse Analyst": {
+      "main": [[{"node": "Update Signal: Analyzed", "type": "main", "index": 0}]]
+    },
+    "Update Signal: Analyzed": {
+      "main": [[{"node": "Risk Controller", "type": "main", "index": 0}]]
+    },
+    "Risk Controller": {
+      "main": [[{"node": "Parse RC Decision", "type": "main", "index": 0}]]
+    },
+    "Parse RC Decision": {
+      "main": [[{"node": "If Approved", "type": "main", "index": 0}]]
+    },
+    "If Approved": {
+      "main": [
+        [{"node": "Update Signal: Approved", "type": "main", "index": 0}],
+        [{"node": "Update Signal: Rejected", "type": "main", "index": 0}]
+      ]
+    },
+    "Update Signal: Approved": {
+      "main": [[{"node": "Compose Trade Card", "type": "main", "index": 0}]]
+    },
+    "Compose Trade Card": {
+      "main": [[{"node": "Send Telegram", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "tags": ["dex", "solana", "scanner"]
+}
